@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chrome Translator
 // @namespace    https://ndllz.cn/
-// @version      1.0.0
+// @version      1.0.2
 // @description  Chrome 浏览器原生翻译功能的沉浸式翻译脚本，支持整页翻译、保留原文对照和自动翻译新增内容
 // @author       ndllz
 // @license      GPL-3.0 License
@@ -146,7 +146,8 @@
     const pairs = document.querySelectorAll('span.ft-pair');
     const oldTranslated = document.querySelectorAll('[data-ft-original]');
     const segmentTranslated = document.querySelectorAll('[data-ft-segment-translated]');
-    return pairs.length > 0 || oldTranslated.length > 0 || segmentTranslated.length > 0;
+    const segmentWrappers = document.querySelectorAll('.ft-segment-wrapper');
+    return pairs.length > 0 || oldTranslated.length > 0 || segmentTranslated.length > 0 || segmentWrappers.length > 0;
   }
   
     // init UI selections
@@ -314,6 +315,17 @@
       let restored = 0;
       
       // 还原新的段落翻译结构
+      const segmentWrappers = Array.from(document.querySelectorAll('.ft-segment-wrapper'));
+      for (const wrapper of segmentWrappers) {
+        const originalText = wrapper.getAttribute('data-ft-segment-original') || '';
+        if (originalText) {
+          const textNode = document.createTextNode(originalText);
+          wrapper.replaceWith(textNode);
+          restored++;
+        }
+      }
+      
+      // 还原旧的翻译对结构
       const pairs = Array.from(document.querySelectorAll('span.ft-pair'));
       for (const w of pairs) {
         const original = w.getAttribute('data-ft-original-text') || w.querySelector('.ft-original')?.textContent || '';
@@ -1703,6 +1715,14 @@ self.onmessage = async (e) => {
   .ft-pair:not(.show-original) .ft-original{ display:none; }
   .ft-segment{ display:inline; }
   .ft-segment .ft-pair{ display:inline; }
+  
+  /* 新的段落翻译样式 */
+  .ft-segment-wrapper{ display:inline; }
+  .ft-segment-original{ opacity:.6; margin-right:.35em; color:#666; }
+  .ft-segment-separator{ margin:0 .2em; }
+  .ft-segment-translated{ color:inherit; }
+  .ft-segment-wrapper:not(.show-original) .ft-segment-original,
+  .ft-segment-wrapper:not(.show-original) .ft-segment-separator{ display:none; }
   @media (prefers-color-scheme: dark){
   .ft-fab{ background:#222; border-color:#444; color:#eee; }
   .ft-ui:hover .ft-fab{ background:#333; }
@@ -1900,99 +1920,114 @@ self.onmessage = async (e) => {
   }
   
     function toggleKeepOriginal(on) {
+      // 处理旧的翻译对结构
       const pairs = document.querySelectorAll('span.ft-pair');
       pairs.forEach((w) => {
         if (on) w.classList.add('show-original');
         else w.classList.remove('show-original');
       });
+      
+      // 处理新的段落翻译结构
+      const segmentWrappers = document.querySelectorAll('.ft-segment-wrapper');
+      segmentWrappers.forEach((w) => {
+        if (on) w.classList.add('show-original');
+        else w.classList.remove('show-original');
+      });
     }
   
-        // 新的段落翻译应用函数
+        // 重新设计的段落翻译应用函数 - 简化且可靠
     function applySegmentTranslation(segment, translatedText) {
-      if (!segment || !segment.textNodes || segment.textNodes.length === 0) return;
+      if (!segment || !segment.textNodes || segment.textNodes.length === 0) {
+        console.warn('[ChromeTranslator] 无效的段落数据:', segment);
+        return;
+      }
       
-      const { element, textNodes, originalText } = segment;
-      const trimmedOriginal = originalText.trim();
+      const { element, textNodes, originalText, trimmedText } = segment;
       const trimmedTranslated = translatedText.trim();
       
-      if (!trimmedTranslated) return;
-      
-      // 创建段落级别的翻译容器
-      const segmentWrapper = document.createElement('span');
-      segmentWrapper.className = 'ft-segment';
-      if (keepOriginal) segmentWrapper.classList.add('show-original');
-      segmentWrapper.setAttribute('data-ft-segment-original', trimmedOriginal);
-      segmentWrapper.setAttribute('data-ft-segment-translated', trimmedTranslated);
-      
-      // 智能分配翻译结果到各个文本节点
-      const translationParts = intelligentTextDistribution(textNodes, originalText, translatedText);
-      
-      // 为每个文本节点创建翻译对
-      const replacements = [];
-      for (let i = 0; i < textNodes.length; i++) {
-        const textNodeInfo = textNodes[i];
-        const translatedPart = translationParts[i] || '';
-        
-        if (!translatedPart.trim()) continue;
-        
-        const wrapper = document.createElement('span');
-        wrapper.className = 'ft-pair';
-        if (keepOriginal) wrapper.classList.add('show-original');
-        wrapper.setAttribute('data-ft-original-text', textNodeInfo.text);
-        
-        const original = document.createElement('span');
-        original.className = 'ft-original';
-        original.textContent = textNodeInfo.text.trim();
-        
-        const translated = document.createElement('span');
-        translated.className = 'ft-translated';
-        translated.textContent = translatedPart;
-        
-        wrapper.append(original, translated);
-        replacements.push({ node: textNodeInfo.node, wrapper: wrapper });
+      if (!trimmedTranslated) {
+        console.warn('[ChromeTranslator] 翻译结果为空:', originalText.substring(0, 50));
+        return;
       }
       
-      // 应用替换
-      for (const { node, wrapper } of replacements) {
-        if (node.parentNode) {
-          node.parentNode.replaceChild(wrapper, node);
+      console.log('[ChromeTranslator] 应用段落翻译:', {
+        element: element.tagName,
+        originalLength: trimmedText.length,
+        translatedLength: trimmedTranslated.length,
+        textNodesCount: textNodes.length
+      });
+      
+      try {
+        // 简化方案：为整个段落创建一个翻译容器
+        const segmentWrapper = document.createElement('div');
+        segmentWrapper.className = 'ft-segment-wrapper';
+        segmentWrapper.setAttribute('data-ft-segment-original', trimmedText);
+        segmentWrapper.setAttribute('data-ft-segment-translated', trimmedTranslated);
+        
+        // 创建原文和译文的显示容器
+        if (keepOriginal) {
+          const originalSpan = document.createElement('span');
+          originalSpan.className = 'ft-segment-original';
+          originalSpan.textContent = trimmedText;
+          segmentWrapper.appendChild(originalSpan);
+          
+          const separator = document.createElement('span');
+          separator.className = 'ft-segment-separator';
+          separator.textContent = ' ';
+          segmentWrapper.appendChild(separator);
         }
+        
+        const translatedSpan = document.createElement('span');
+        translatedSpan.className = 'ft-segment-translated';
+        translatedSpan.textContent = trimmedTranslated;
+        segmentWrapper.appendChild(translatedSpan);
+        
+        // 替换第一个文本节点，删除其他文本节点
+        let firstNodeReplaced = false;
+        for (const textNodeInfo of textNodes) {
+          const node = textNodeInfo.node;
+          if (node && node.parentNode) {
+            if (!firstNodeReplaced) {
+              // 用翻译容器替换第一个文本节点
+              node.parentNode.replaceChild(segmentWrapper, node);
+              firstNodeReplaced = true;
+            } else {
+              // 删除其他文本节点（它们的内容已经包含在段落翻译中）
+              node.parentNode.removeChild(node);
+            }
+          }
+        }
+        
+        // 标记元素为已翻译
+        element.setAttribute('data-ft-segment-translated', 'true');
+        
+        console.log('[ChromeTranslator] 段落翻译应用成功');
+        
+      } catch (error) {
+        console.error('[ChromeTranslator] 段落翻译应用失败:', error);
+        // 失败时回退到原有的单节点翻译方式
+        fallbackToNodeTranslation(segment, translatedText);
       }
-      
-      // 标记整个元素为已翻译
-      element.setAttribute('data-ft-segment-translated', 'true');
     }
     
-    // 智能分配翻译文本到原始文本节点
-    function intelligentTextDistribution(textNodes, originalText, translatedText) {
-      if (textNodes.length === 0) return [];
-      if (textNodes.length === 1) return [translatedText];
+    // 回退到单节点翻译的备用方案
+    function fallbackToNodeTranslation(segment, translatedText) {
+      console.log('[ChromeTranslator] 使用回退翻译方案');
+      const { textNodes } = segment;
       
-      // 简单策略：按原文长度比例分配翻译文本
-      const totalOriginalLength = originalText.trim().length;
-      const translatedWords = translatedText.trim().split(/\s+/);
-      const results = [];
-      
-      let usedWords = 0;
-      for (let i = 0; i < textNodes.length; i++) {
-        const nodeText = textNodes[i].text.trim();
-        const nodeLength = nodeText.length;
-        
-        if (i === textNodes.length - 1) {
-          // 最后一个节点，分配剩余的所有词
-          results.push(translatedWords.slice(usedWords).join(' '));
-        } else {
-          // 按比例分配词数
-          const ratio = nodeLength / totalOriginalLength;
-          const wordsToAssign = Math.max(1, Math.round(translatedWords.length * ratio));
-          const assignedWords = translatedWords.slice(usedWords, usedWords + wordsToAssign);
-          results.push(assignedWords.join(' '));
-          usedWords += wordsToAssign;
-        }
+      // 简单地将翻译结果应用到第一个文本节点
+      if (textNodes.length > 0) {
+        const firstNode = textNodes[0];
+        applyTranslationToNode(
+          firstNode.node, 
+          firstNode.text, 
+          '', 
+          '', 
+          translatedText
+        );
       }
-      
-      return results;
     }
+
     
     // 保留原有的单节点翻译函数作为备用
     function applyTranslationToNode(node, original, leading, trailing, translatedPretty) {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chrome Translator
 // @namespace    https://ndllz.cn/
-// @version      1.0.6
+// @version      1.0.7
 // @description  Chrome 浏览器原生翻译功能的沉浸式翻译脚本，支持整页翻译、保留原文对照和自动翻译新增内容
 // @author       ndllz
 // @license      GPL-3.0 License
@@ -283,42 +283,90 @@
           });
         };
         
-        // 段落翻译应用函数
+        // 段落翻译应用函数 - 修复版本
         function applyParagraphTranslation(paragraph, translatedText) {
           const { element, fullText, textNodes } = paragraph;
+          
+          if (!textNodes || textNodes.length === 0) {
+            console.warn('[ChromeTranslator] 无效的段落数据:', paragraph);
+            return;
+          }
           
           // 创建段落级翻译标记
           element.setAttribute('data-ft-paragraph-original', fullText);
           element.setAttribute('data-ft-paragraph-translated', translatedText);
           
-          // 智能分配翻译结果到各个文本节点
-          if (textNodes.length === 1) {
-            // 单个文本节点，直接替换
-            const textNode = textNodes[0].node;
-            const wrapper = document.createElement('span');
-            wrapper.className = 'ft-pair';
-            if (keepOriginal) wrapper.classList.add('show-original');
-            wrapper.setAttribute('data-ft-original-text', fullText);
-            
-            const originalSpan = document.createElement('span');
-            originalSpan.className = 'ft-original';
-            originalSpan.textContent = fullText;
-            
-            const translatedSpan = document.createElement('span');
-            translatedSpan.className = 'ft-translated';
-            translatedSpan.textContent = translatedText;
-            
-            wrapper.appendChild(originalSpan);
-            wrapper.appendChild(translatedSpan);
-            
-            textNode.parentNode.replaceChild(wrapper, textNode);
-          } else {
-            // 多个文本节点，保持DOM结构，只替换文本内容
-            // 简化策略：将翻译结果放在第一个文本节点，其他节点清空
-            for (let i = 0; i < textNodes.length; i++) {
-              const textNode = textNodes[i].node;
-              if (i === 0) {
-                // 第一个节点显示完整翻译
+          try {
+            if (textNodes.length === 1) {
+              // 单个文本节点，直接替换
+              const textNode = textNodes[0].node;
+              if (!textNode || !textNode.parentNode) {
+                console.warn('[ChromeTranslator] 文本节点无效或已被移除');
+                return;
+              }
+              
+              const wrapper = document.createElement('span');
+              wrapper.className = 'ft-pair';
+              if (keepOriginal) wrapper.classList.add('show-original');
+              wrapper.setAttribute('data-ft-original-text', fullText);
+              
+              const originalSpan = document.createElement('span');
+              originalSpan.className = 'ft-original';
+              originalSpan.textContent = fullText;
+              
+              const translatedSpan = document.createElement('span');
+              translatedSpan.className = 'ft-translated';
+              translatedSpan.textContent = translatedText;
+              
+              wrapper.appendChild(originalSpan);
+              wrapper.appendChild(translatedSpan);
+              
+              textNode.parentNode.replaceChild(wrapper, textNode);
+            } else {
+              // 多个文本节点 - 改进策略：保持所有节点，只在第一个节点添加翻译
+              let translationAdded = false;
+              
+              for (let i = 0; i < textNodes.length; i++) {
+                const textNode = textNodes[i].node;
+                if (!textNode || !textNode.parentNode) continue;
+                
+                if (!translationAdded && textNode.nodeValue && textNode.nodeValue.trim()) {
+                  // 在第一个有内容的文本节点前插入翻译
+                  const wrapper = document.createElement('span');
+                  wrapper.className = 'ft-pair';
+                  if (keepOriginal) wrapper.classList.add('show-original');
+                  wrapper.setAttribute('data-ft-original-text', fullText);
+                  
+                  const originalSpan = document.createElement('span');
+                  originalSpan.className = 'ft-original';
+                  originalSpan.textContent = fullText;
+                  
+                  const translatedSpan = document.createElement('span');
+                  translatedSpan.className = 'ft-translated';
+                  translatedSpan.textContent = translatedText;
+                  
+                  wrapper.appendChild(originalSpan);
+                  wrapper.appendChild(translatedSpan);
+                  
+                  // 在文本节点前插入翻译，而不是替换
+                  textNode.parentNode.insertBefore(wrapper, textNode);
+                  
+                  // 隐藏原始文本节点但不删除
+                  if (!keepOriginal) {
+                    textNode.style = textNode.style || {};
+                    textNode.parentNode.style.position = 'relative';
+                    const hiddenSpan = document.createElement('span');
+                    hiddenSpan.style.display = 'none';
+                    hiddenSpan.appendChild(textNode.cloneNode(true));
+                    textNode.parentNode.replaceChild(hiddenSpan, textNode);
+                  }
+                  
+                  translationAdded = true;
+                }
+              }
+              
+              if (!translationAdded) {
+                // 如果没有找到合适的位置，在元素开头添加翻译
                 const wrapper = document.createElement('span');
                 wrapper.className = 'ft-pair';
                 if (keepOriginal) wrapper.classList.add('show-original');
@@ -335,11 +383,21 @@
                 wrapper.appendChild(originalSpan);
                 wrapper.appendChild(translatedSpan);
                 
-                textNode.parentNode.replaceChild(wrapper, textNode);
-              } else {
-                // 其他节点隐藏原文，避免重复显示
-                textNode.nodeValue = '';
+                element.insertBefore(wrapper, element.firstChild);
               }
+            }
+          } catch (error) {
+            console.error('[ChromeTranslator] 段落翻译应用失败:', error);
+            // 降级到简单的文本替换
+            try {
+              element.setAttribute('data-ft-fallback-original', fullText);
+              const translationDiv = document.createElement('div');
+              translationDiv.className = 'ft-fallback-translation';
+              translationDiv.style.cssText = 'background: #f0f8ff; padding: 4px; margin: 2px 0; border-left: 3px solid #007acc;';
+              translationDiv.textContent = translatedText;
+              element.insertBefore(translationDiv, element.firstChild);
+            } catch (fallbackError) {
+              console.error('[ChromeTranslator] 降级翻译也失败:', fallbackError);
             }
           }
         }
@@ -546,29 +604,33 @@
         element.removeAttribute('data-ft-paragraph-original');
         element.removeAttribute('data-ft-paragraph-translated');
         
-        // 还原段落内的文本节点
+        // 移除翻译对
         const pairs = element.querySelectorAll('.ft-pair');
         for (const pair of pairs) {
-          const textNode = document.createTextNode(originalText);
-          pair.replaceWith(textNode);
+          pair.remove();
           restored++;
-          break; // 只需要还原一次
         }
         
-        // 还原被清空的文本节点
-        const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
-        let textNode;
-        let hasContent = false;
-        while ((textNode = walker.nextNode())) {
-          if (textNode.nodeValue && textNode.nodeValue.trim()) {
-            hasContent = true;
-            break;
+        // 还原隐藏的文本节点
+        const hiddenSpans = element.querySelectorAll('span[style*="display: none"]');
+        for (const hiddenSpan of hiddenSpans) {
+          const textNode = hiddenSpan.firstChild;
+          if (textNode) {
+            hiddenSpan.parentNode.replaceChild(textNode, hiddenSpan);
+            restored++;
           }
         }
         
-        if (!hasContent) {
-          // 如果没有文本内容，重新设置
-          element.textContent = originalText;
+        // 移除降级翻译
+        const fallbackTranslations = element.querySelectorAll('.ft-fallback-translation');
+        for (const fallback of fallbackTranslations) {
+          fallback.remove();
+          restored++;
+        }
+        
+        // 如果元素有降级原文属性，还原它
+        if (element.hasAttribute('data-ft-fallback-original')) {
+          element.removeAttribute('data-ft-fallback-original');
           restored++;
         }
       }
@@ -903,7 +965,8 @@
       async function canUseWorkerTranslator(src, tgt) {
     try {
       // 首先检测CSP是否允许创建Worker
-      if (!canCreateWorker()) {
+      const canCreate = await canCreateWorker();
+      if (!canCreate) {
         console.log('[ChromeTranslator] Web Workers blocked by CSP, falling back to main thread');
         return false;
       }
@@ -917,6 +980,12 @@
           if (e.data && e.data.type === 'ready') { clearTimeout(timer); resolve(true); worker.terminate(); }
           else if (e.data && e.data.type === 'error') { clearTimeout(timer); resolve(false); worker.terminate(); }
         };
+        worker.onerror = (error) => {
+          console.log('[ChromeTranslator] Worker initialization failed:', error.message);
+          clearTimeout(timer);
+          resolve(false);
+          worker.terminate();
+        };
       });
       worker.postMessage({ type: 'init-check' });
       return await ready;
@@ -928,17 +997,53 @@
 
   function canCreateWorker() {
     try {
-      // 尝试创建一个简单的Worker来检测CSP
+      // 检查CSP策略
+      const csp = document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+      if (csp) {
+        const cspContent = csp.getAttribute('content') || '';
+        // 检查worker-src指令
+        if (cspContent.includes('worker-src') && !cspContent.includes("worker-src 'unsafe-inline'") && !cspContent.includes('worker-src *')) {
+          console.log('[ChromeTranslator] CSP worker-src directive detected, falling back to main thread');
+          return false;
+        }
+      }
+      
+      // 检查HTTP头中的CSP（通过尝试创建Worker）
       const testWorkerCode = 'self.postMessage("test");';
       const blob = new Blob([testWorkerCode], { type: 'application/javascript' });
       const workerURL = URL.createObjectURL(blob);
-      const testWorker = new Worker(workerURL);
-      testWorker.terminate();
-      URL.revokeObjectURL(workerURL);
-      return true;
+      
+      // 使用Promise来处理异步错误
+      return new Promise((resolve) => {
+        try {
+          const testWorker = new Worker(workerURL);
+          testWorker.onmessage = () => {
+            testWorker.terminate();
+            URL.revokeObjectURL(workerURL);
+            resolve(true);
+          };
+          testWorker.onerror = (error) => {
+            console.log('[ChromeTranslator] Worker creation blocked by CSP:', error.message);
+            testWorker.terminate();
+            URL.revokeObjectURL(workerURL);
+            resolve(false);
+          };
+          testWorker.postMessage('test');
+          
+          // 超时处理
+          setTimeout(() => {
+            testWorker.terminate();
+            URL.revokeObjectURL(workerURL);
+            resolve(false);
+          }, 1000);
+        } catch (e) {
+          URL.revokeObjectURL(workerURL);
+          console.log('[ChromeTranslator] Worker creation blocked by CSP:', e.message);
+          resolve(false);
+        }
+      });
     } catch (e) {
-      // 如果创建Worker失败，说明被CSP阻止
-      console.log('[ChromeTranslator] Worker creation blocked by CSP:', e.message);
+      console.log('[ChromeTranslator] CSP detection failed:', e.message);
       return false;
     }
   }
@@ -2220,6 +2325,17 @@ self.onmessage = async (e) => {
   .ft-retry-button{ transition:all 0.2s ease; }
   .ft-retry-button:hover{ background:#2563eb !important; transform:translateY(-1px); }
   
+  /* 降级翻译样式 */
+  .ft-fallback-translation{ 
+    background: #f0f8ff !important; 
+    padding: 4px !important; 
+    margin: 2px 0 !important; 
+    border-left: 3px solid #007acc !important;
+    font-size: 0.9em !important;
+    color: #333 !important;
+    border-radius: 3px !important;
+  }
+  
   /* 成功/错误状态 */
   .ft-translate-btn.success{
     background:linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
@@ -3172,3 +3288,4 @@ self.onmessage = async (e) => {
   
   
   
+

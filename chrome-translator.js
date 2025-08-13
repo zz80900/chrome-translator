@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chrome Translator
 // @namespace    https://ndllz.cn/
-// @version      1.0.2
+// @version      1.0.3
 // @description  Chrome 浏览器原生翻译功能的沉浸式翻译脚本，支持整页翻译、保留原文对照和自动翻译新增内容
 // @author       ndllz
 // @license      GPL-3.0 License
@@ -217,64 +217,54 @@
           lastPairKey = pairKey;
         }
   
-                        // 使用新的分段翻译逻辑
-        const segments = collectTextSegments(document.body);
-        ui.progressText.textContent = `扫描到 ${segments.length} 个文本段落，开始并行翻译（并发 ${Math.min(MAX_CONCURRENCY, 3)}）...`;
-        setButtonState('loading', `扫描到 ${segments.length} 个段落`);
+                        // 临时回退到原有的文本节点翻译逻辑以确保内容不丢失
+        console.log('[ChromeTranslator] 使用安全的文本节点翻译模式');
+        const nodes = collectTextNodes(document.body);
+        ui.progressText.textContent = `扫描到 ${nodes.length} 个文本节点，开始并行翻译（并发 ${MAX_CONCURRENCY}）...`;
+        setButtonState('loading', `扫描到 ${nodes.length} 个文本`);
         setProgress(0, true);
 
         const useWorker = await canUseWorkerTranslator(realSource, targetLang);
         let done = 0;
         const updateProgress = () => { 
-          if (done % 5 === 0 || done === segments.length) {
-            const percentage = segments.length > 0 ? (done / segments.length) * 100 : 0;
-            ui.progressText.textContent = `已翻译 ${done}/${segments.length} 个段落`;
-            setButtonState('loading', `翻译中 ${done}/${segments.length}`);
+          if (done % 20 === 0 || done === nodes.length) {
+            const percentage = nodes.length > 0 ? (done / nodes.length) * 100 : 0;
+            ui.progressText.textContent = `已翻译 ${done}/${nodes.length}`;
+            setButtonState('loading', `翻译中 ${done}/${nodes.length}`);
             setProgress(percentage, true);
           }
         };
 
-        // 段落翻译使用较低的并发数以保证质量
-        const segmentConcurrency = Math.min(3, MAX_CONCURRENCY);
-
         if (useWorker) {
-          const pool = await createWorkerPool(segmentConcurrency, realSource, targetLang);
+          const pool = await createWorkerPool(MAX_CONCURRENCY, realSource, targetLang);
           try {
-            const tasks = segments.map((segment) => async () => {
-              if (!segment.trimmedText) { done++; updateProgress(); return; }
+            const tasks = nodes.map(({ node, original, leading, trailing }) => async () => {
+              if (!original.trim()) { done++; updateProgress(); return; }
               try {
-                const translated = await pool.translate(segment.trimmedText.replace(/\n/g, '<br>'));
+                const translated = await pool.translate(original.replace(/\n/g, '<br>'));
                 const pretty = (translated || '').replace(/<br>/g, '\n').trim();
-                if (pretty) {
-                  applySegmentTranslation(segment, pretty);
-                }
-              } catch (error) {
-                console.warn('[ChromeTranslator] 段落翻译失败:', error, segment.trimmedText.substring(0, 50));
-              }
+                applyTranslationToNode(node, original, leading, trailing, pretty);
+              } catch {}
               finally { done++; updateProgress(); }
             });
-            await runWithConcurrency(tasks, segmentConcurrency);
+            await runWithConcurrency(tasks, MAX_CONCURRENCY);
           } finally { pool.terminate(); }
         }
         else {
           // Fallback: main-thread concurrency using a single translator instance
-          const limit = createLimiter(segmentConcurrency);
-          await Promise.all(segments.map((segment) => limit(async () => {
-            if (!segment.trimmedText) { done++; updateProgress(); return; }
+          const limit = createLimiter(Math.max(2, Math.min(3, MAX_CONCURRENCY)));
+          await Promise.all(nodes.map(({ node, original, leading, trailing }) => limit(async () => {
+            if (!original.trim()) { done++; updateProgress(); return; }
             try {
-              const translated = await translateStreaming(segment.trimmedText.replace(/\n/g, '<br>'));
+              const translated = await translateStreaming(`${original.replace(/\n/g, '<br>')}`);
               const pretty = (translated || '').replace(/<br>/g, '\n').trim();
-              if (pretty) {
-                applySegmentTranslation(segment, pretty);
-              }
-            } catch (error) {
-              console.warn('[ChromeTranslator] 段落翻译失败:', error, segment.trimmedText.substring(0, 50));
-            }
+              applyTranslationToNode(node, original, leading, trailing, pretty);
+            } catch {}
             finally { done++; updateProgress(); }
           })));
         }
   
-              ui.progressText.textContent = `翻译完成：${done}/${segments.length} 个段落`;
+              ui.progressText.textContent = `翻译完成：${done}/${nodes.length}`;
       
       // 更新翻译状态
       isPageTranslated = true;
@@ -282,7 +272,7 @@
       // 显示成功状态
       ui.fab.classList.add('ft-success', 'ft-translated');
       ui.container.updateFabTooltip(); // 更新提示词
-      setButtonState('success', `翻译完成 ${done}/${segments.length}`);
+      setButtonState('success', `翻译完成 ${done}/${nodes.length}`);
       setProgress(100, false); // 隐藏进度条
       setTimeout(() => {
         ui.fab.classList.remove('ft-success');
@@ -1958,8 +1948,8 @@ self.onmessage = async (e) => {
       });
       
       try {
-        // 简化方案：为整个段落创建一个翻译容器
-        const segmentWrapper = document.createElement('div');
+        // 修复方案：使用span元素保持内联布局，只替换第一个文本节点
+        const segmentWrapper = document.createElement('span');
         segmentWrapper.className = 'ft-segment-wrapper';
         segmentWrapper.setAttribute('data-ft-segment-original', trimmedText);
         segmentWrapper.setAttribute('data-ft-segment-translated', trimmedTranslated);
@@ -1982,18 +1972,19 @@ self.onmessage = async (e) => {
         translatedSpan.textContent = trimmedTranslated;
         segmentWrapper.appendChild(translatedSpan);
         
-        // 替换第一个文本节点，删除其他文本节点
-        let firstNodeReplaced = false;
-        for (const textNodeInfo of textNodes) {
-          const node = textNodeInfo.node;
-          if (node && node.parentNode) {
-            if (!firstNodeReplaced) {
-              // 用翻译容器替换第一个文本节点
-              node.parentNode.replaceChild(segmentWrapper, node);
-              firstNodeReplaced = true;
-            } else {
-              // 删除其他文本节点（它们的内容已经包含在段落翻译中）
-              node.parentNode.removeChild(node);
+        // 安全的节点替换：只替换第一个文本节点，保留其他节点
+        if (textNodes.length > 0) {
+          const firstNode = textNodes[0].node;
+          if (firstNode && firstNode.parentNode) {
+            // 用翻译容器替换第一个文本节点
+            firstNode.parentNode.replaceChild(segmentWrapper, firstNode);
+            
+            // 清空其他文本节点的内容，但不删除它们（避免破坏DOM结构）
+            for (let i = 1; i < textNodes.length; i++) {
+              const node = textNodes[i].node;
+              if (node && node.parentNode) {
+                node.textContent = ''; // 清空内容而不是删除节点
+              }
             }
           }
         }

@@ -1,0 +1,8 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+
+## 变更记录
+- 每一次修改都需要同步更新README.MD和js脚本中的版本号

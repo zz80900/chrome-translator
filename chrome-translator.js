@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chrome Translator
 // @namespace    https://ndllz.cn/
-// @version      1.0.3
+// @version      1.0.4
 // @description  Chrome 浏览器原生翻译功能的沉浸式翻译脚本，支持整页翻译、保留原文对照和自动翻译新增内容
 // @author       ndllz
 // @license      GPL-3.0 License
@@ -839,7 +839,192 @@ self.onmessage = async (e) => {
       };
     }
     
-    // 保留原有的collectTextNodes函数作为备用
+    // --------------------------
+    // 智能内容类型检测 - 针对Markdown优化
+    // --------------------------
+    
+    // 检测文本是否包含不应翻译的内容
+    function shouldSkipTranslation(text, parentElement) {
+      if (!text || !text.trim()) return true;
+      
+      const trimmedText = text.trim();
+      
+      // 0. 检测父元素环境 - 优先级最高
+      if (isInCodeEnvironment(parentElement)) return true;
+      
+      // 1. 检测URL和链接
+      if (isUrlOrLink(trimmedText)) return true;
+      
+      // 2. 检测代码和技术术语
+      if (isCodeOrTechnicalTerm(trimmedText)) return true;
+      
+      // 3. 检测Markdown语法
+      if (isMarkdownSyntax(trimmedText)) return true;
+      
+      // 4. 检测纯标点符号
+      if (/^[\s\p{P}\p{S}]+$/u.test(trimmedText)) return true;
+      
+      // 5. 检测数字和版本号
+      if (isNumberOrVersion(trimmedText)) return true;
+      
+      // 6. 检测短的技术词汇（长度小于等于3的英文单词，可能是API名称）
+      if (isShortTechnicalWord(trimmedText)) return true;
+      
+      return false;
+    }
+    
+    // 检测是否在代码环境中
+    function isInCodeEnvironment(element) {
+      if (!element) return false;
+      
+      // 检查元素及其父元素的类名和属性
+      let current = element;
+      let depth = 0;
+      
+      while (current && depth < 5) { // 最多检查5层父元素
+        // 检查标签名
+        const tagName = current.tagName?.toLowerCase();
+        if (['code', 'pre', 'kbd', 'samp', 'tt', 'var'].includes(tagName)) {
+          return true;
+        }
+        
+        // 检查类名
+        const className = current.className || '';
+        if (typeof className === 'string') {
+          const codeClassPatterns = [
+            /\bcode\b/i,
+            /\bpre\b/i,
+            /\bhighlight\b/i,
+            /\blanguage-/i,
+            /\bhljs\b/i,
+            /\bcodehilite\b/i,
+            /\bsyntax\b/i,
+            /\bmonospace\b/i
+          ];
+          
+          if (codeClassPatterns.some(pattern => pattern.test(className))) {
+            return true;
+          }
+        }
+        
+        // 检查data属性
+        if (current.hasAttribute && (
+          current.hasAttribute('data-lang') ||
+          current.hasAttribute('data-language') ||
+          current.hasAttribute('data-code')
+        )) {
+          return true;
+        }
+        
+        current = current.parentElement;
+        depth++;
+      }
+      
+      return false;
+    }
+    
+    // 检测短的技术词汇
+    function isShortTechnicalWord(text) {
+      // 短的技术词汇通常是API名称、配置项等
+      if (text.length > 3) return false;
+      
+      // 纯大写字母（如API、URL、CSS）
+      if (/^[A-Z]{2,3}$/.test(text)) return true;
+      
+      // 常见的技术缩写
+      const technicalAbbreviations = [
+        'API', 'URL', 'CSS', 'HTML', 'XML', 'JSON', 'HTTP', 'HTTPS', 'FTP',
+        'SSH', 'SSL', 'TLS', 'DNS', 'CDN', 'SDK', 'CLI', 'GUI', 'IDE',
+        'SQL', 'NoSQL', 'REST', 'SOAP', 'JWT', 'OAuth', 'CORS', 'CSRF'
+      ];
+      
+      return technicalAbbreviations.includes(text.toUpperCase());
+    }
+    
+    // 检测URL和链接
+    function isUrlOrLink(text) {
+      // URL模式
+      const urlPatterns = [
+        /^https?:\/\/[^\s]+$/i,
+        /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(\/[^\s]*)?$/,
+        /^[a-zA-Z0-9.-]+\.io(\/[^\s]*)?$/i,
+        /^[a-zA-Z0-9.-]+\.com(\/[^\s]*)?$/i,
+        /^[a-zA-Z0-9.-]+\.org(\/[^\s]*)?$/i,
+        /^kubernetes\.io[^\s]*$/i,
+        /^github\.com[^\s]*$/i
+      ];
+      
+      return urlPatterns.some(pattern => pattern.test(text));
+    }
+    
+    // 检测代码和技术术语
+    function isCodeOrTechnicalTerm(text) {
+      // 代码和技术术语模式
+      const codePatterns = [
+        /^[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_.]*$/, // 如 spec.ingressClassName
+        /^[a-zA-Z_][a-zA-Z0-9_]*::[a-zA-Z_][a-zA-Z0-9_]*$/, // 如 namespace::class
+        /^--[a-zA-Z-]+(-[a-zA-Z-]+)*$/, // 如 --nginx-ingress-classes
+        /^-[a-zA-Z]$/, // 单字母参数如 -f
+        /^[A-Z_][A-Z0-9_]*$/, // 常量如 MAX_SIZE
+        /^[a-z]+[A-Z][a-zA-Z0-9]*$/, // 驼峰命名如 camelCase
+        /^\$[a-zA-Z_][a-zA-Z0-9_]*$/, // 变量如 $variable
+        /^@[a-zA-Z_][a-zA-Z0-9_]*$/, // 装饰器如 @Component
+        /^#[a-zA-Z_][a-zA-Z0-9_]*$/, // 哈希如 #header
+        /^[a-zA-Z0-9_-]+\/[a-zA-Z0-9_-]+$/, // 路径如 path/to
+        /^[a-zA-Z0-9_-]+:[a-zA-Z0-9_-]+$/, // 键值对如 key:value
+        /^[a-zA-Z][a-zA-Z0-9]*\(\)$/, // 函数调用如 function()
+        /^[a-zA-Z][a-zA-Z0-9]*\[\]$/, // 数组如 array[]
+        /^[a-zA-Z][a-zA-Z0-9]*\{\}$/, // 对象如 object{}
+      ];
+      
+      // 特定的技术术语和配置项
+      const technicalTerms = [
+        'kubernetes', 'ingress', 'nginx', 'controller', 'rollouts', 'argo',
+        'spec', 'metadata', 'annotations', 'labels', 'namespace', 'deployment',
+        'service', 'configmap', 'secret', 'pod', 'node', 'cluster',
+        'kubectl', 'helm', 'docker', 'container', 'image', 'registry',
+        'yaml', 'json', 'api', 'endpoint', 'webhook', 'crd', 'rbac'
+      ];
+      
+      // 检查是否匹配模式
+      if (codePatterns.some(pattern => pattern.test(text))) return true;
+      
+      // 检查是否为技术术语（不区分大小写）
+      if (technicalTerms.includes(text.toLowerCase())) return true;
+      
+      return false;
+    }
+    
+    // 检测Markdown语法
+    function isMarkdownSyntax(text) {
+      const markdownPatterns = [
+        /^#{1,6}\s/, // 标题 # ## ###
+        /^\*\s/, // 列表 *
+        /^-\s/, // 列表 -
+        /^\d+\.\s/, // 有序列表 1.
+        /^>\s/, // 引用 >
+        /^```/, // 代码块 ```
+        /^`[^`]+`$/, // 内联代码 `code`
+        /^\[[^\]]+\]\([^)]+\)$/, // 链接 [text](url)
+        /^!\[[^\]]*\]\([^)]+\)$/, // 图片 ![alt](url)
+      ];
+      
+      return markdownPatterns.some(pattern => pattern.test(text));
+    }
+    
+    // 检测数字和版本号
+    function isNumberOrVersion(text) {
+      const numberPatterns = [
+        /^\d+$/, // 纯数字
+        /^\d+\.\d+(\.\d+)?$/, // 版本号如 1.0.0
+        /^v\d+\.\d+(\.\d+)?$/, // 版本号如 v1.0.0
+        /^\d+[a-zA-Z]+$/, // 如 5px, 10ms
+      ];
+      
+      return numberPatterns.some(pattern => pattern.test(text));
+    }
+    
+    // 增强的collectTextNodes函数 - 支持智能内容过滤
     function collectTextNodes(root) {
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
@@ -847,27 +1032,36 @@ self.onmessage = async (e) => {
           if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
           const p = node.parentElement;
           if (!p) return NodeFilter.FILTER_REJECT;
+          
           // skip UI panel - critical to prevent UI removal
           if (p.closest('.ft-ui')) return NodeFilter.FILTER_REJECT;
+          
           // skip hidden
           const style = getComputedStyle(p);
           if (style && (style.display === 'none' || style.visibility === 'hidden')) return NodeFilter.FILTER_REJECT;
-          // skip code/script/etc
+          
+          // skip code/script/etc - 扩展代码标签列表
           const tag = p.tagName.toLowerCase();
-          if (['script','style','noscript','textarea','input','code','pre','svg','math','kbd','samp'].includes(tag)) {
+          if (['script','style','noscript','textarea','input','code','pre','svg','math','kbd','samp','tt','var'].includes(tag)) {
             return NodeFilter.FILTER_REJECT;
           }
+          
           // skip marked notranslate
           if (p.closest('.notranslate,[translate="no"]')) return NodeFilter.FILTER_REJECT;
-          // short punctuation-only
-          if (/^[\s\p{P}\p{S}]+$/u.test(node.nodeValue)) return NodeFilter.FILTER_REJECT;
+          
+          // 智能内容检测 - 跳过不应翻译的内容
+          if (shouldSkipTranslation(node.nodeValue, p)) return NodeFilter.FILTER_REJECT;
+          
           // already translated using legacy flag
           if (p.hasAttribute('data-ft-original')) return NodeFilter.FILTER_SKIP;
+          
           // skip if inside ft-pair wrapper
           if (p.closest('.ft-pair')) return NodeFilter.FILTER_REJECT;
+          
           return NodeFilter.FILTER_ACCEPT;
         }
       });
+      
       const nodes = [];
       let n;
       while ((n = walker.nextNode())) {
@@ -876,6 +1070,8 @@ self.onmessage = async (e) => {
         const trailing = original.match(/\s*$/)[0] || '';
         nodes.push({ node: n, original, leading, trailing });
       }
+      
+      console.log(`[ChromeTranslator] 智能过滤后收集到 ${nodes.length} 个可翻译文本节点`);
       return nodes;
     }
   

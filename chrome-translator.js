@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chrome Translator
 // @namespace    https://ndllz.cn/
-// @version      1.0.7
+// @version      1.0.8
 // @description  Chrome 浏览器原生翻译功能的沉浸式翻译脚本，支持整页翻译、保留原文对照和自动翻译新增内容
 // @author       ndllz
 // @license      GPL-3.0 License
@@ -283,12 +283,19 @@
           });
         };
         
-        // 段落翻译应用函数 - 修复版本
+        // 段落翻译应用函数 - 修复版本，支持React安全模式
         function applyParagraphTranslation(paragraph, translatedText) {
           const { element, fullText, textNodes } = paragraph;
           
           if (!textNodes || textNodes.length === 0) {
             console.warn('[ChromeTranslator] 无效的段落数据:', paragraph);
+            return;
+          }
+          
+          // 检查是否为React管理的元素，使用安全模式
+          if (isReactManagedElement(element)) {
+            console.log('[ChromeTranslator] 检测到React元素，使用安全翻译模式');
+            applyReactSafeTranslation(element, fullText, translatedText);
             return;
           }
           
@@ -399,6 +406,103 @@
             } catch (fallbackError) {
               console.error('[ChromeTranslator] 降级翻译也失败:', fallbackError);
             }
+          }
+        }
+        
+        // React安全翻译函数 - 非侵入式翻译
+        function applyReactSafeTranslation(element, originalText, translatedText) {
+          try {
+            // 创建一个浮动的翻译提示框，而不是修改DOM结构
+            const translationTooltip = document.createElement('div');
+            translationTooltip.className = 'ft-react-safe-translation';
+            translationTooltip.setAttribute('data-ft-original', originalText);
+            translationTooltip.setAttribute('data-ft-translated', translatedText);
+            
+            // 设置样式
+            translationTooltip.style.cssText = `
+              position: absolute;
+              background: rgba(0, 123, 255, 0.9);
+              color: white;
+              padding: 8px 12px;
+              border-radius: 6px;
+              font-size: 12px;
+              max-width: 300px;
+              word-wrap: break-word;
+              z-index: 10000;
+              box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+              pointer-events: none;
+              opacity: 0;
+              transition: opacity 0.3s ease;
+              border: 1px solid rgba(255,255,255,0.2);
+            `;
+            
+            // 添加翻译内容
+            if (keepOriginal) {
+              translationTooltip.innerHTML = `
+                <div style="font-weight: bold; margin-bottom: 4px; opacity: 0.8;">原文:</div>
+                <div style="margin-bottom: 8px; font-size: 11px;">${originalText}</div>
+                <div style="font-weight: bold; margin-bottom: 4px; opacity: 0.8;">翻译:</div>
+                <div>${translatedText}</div>
+              `;
+            } else {
+              translationTooltip.textContent = translatedText;
+            }
+            
+            // 计算位置
+            const rect = element.getBoundingClientRect();
+            const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+            const scrollLeft = window.pageXOffset || document.documentElement.scrollLeft;
+            
+            translationTooltip.style.left = (rect.left + scrollLeft) + 'px';
+            translationTooltip.style.top = (rect.top + scrollTop - 10) + 'px';
+            
+            // 添加到页面
+            document.body.appendChild(translationTooltip);
+            
+            // 显示动画
+            requestAnimationFrame(() => {
+              translationTooltip.style.opacity = '1';
+            });
+            
+            // 添加鼠标事件
+            let hideTimer;
+            
+            const showTooltip = () => {
+              clearTimeout(hideTimer);
+              translationTooltip.style.opacity = '1';
+            };
+            
+            const hideTooltip = () => {
+              hideTimer = setTimeout(() => {
+                translationTooltip.style.opacity = '0';
+              }, 500);
+            };
+            
+            element.addEventListener('mouseenter', showTooltip);
+            element.addEventListener('mouseleave', hideTooltip);
+            
+            // 标记元素已处理
+            element.setAttribute('data-ft-react-safe', 'true');
+            
+            // 5秒后自动隐藏
+            setTimeout(() => {
+              if (translationTooltip.parentNode) {
+                translationTooltip.style.opacity = '0';
+                setTimeout(() => {
+                  if (translationTooltip.parentNode) {
+                    translationTooltip.remove();
+                  }
+                }, 300);
+              }
+            }, 5000);
+            
+            console.log('[ChromeTranslator] React安全翻译已应用');
+            
+          } catch (error) {
+            console.error('[ChromeTranslator] React安全翻译失败:', error);
+            // 降级到简单提示
+            element.title = `翻译: ${translatedText}`;
+            element.setAttribute('data-ft-react-safe-fallback', translatedText);
           }
         }
 
@@ -596,6 +700,26 @@
       setPanelBusy(false);
       
       let restored = 0;
+      
+      // 还原React安全翻译
+      const reactSafeElements = Array.from(document.querySelectorAll('[data-ft-react-safe]'));
+      for (const element of reactSafeElements) {
+        element.removeAttribute('data-ft-react-safe');
+        element.removeEventListener('mouseenter', () => {});
+        element.removeEventListener('mouseleave', () => {});
+        if (element.hasAttribute('data-ft-react-safe-fallback')) {
+          element.removeAttribute('data-ft-react-safe-fallback');
+          element.removeAttribute('title');
+        }
+        restored++;
+      }
+      
+      // 移除所有React安全翻译提示框
+      const reactSafeTooltips = Array.from(document.querySelectorAll('.ft-react-safe-translation'));
+      for (const tooltip of reactSafeTooltips) {
+        tooltip.remove();
+        restored++;
+      }
       
       // 还原段落级翻译结构
       const paragraphElements = Array.from(document.querySelectorAll('[data-ft-paragraph-original]'));
@@ -1493,6 +1617,12 @@ self.onmessage = async (e) => {
         // 跳过UI面板
         if (element.closest('.ft-ui')) return true;
         
+        // 跳过React管理的元素 - 防止React错误#482
+        if (isReactManagedElement(element)) return true;
+        
+        // 跳过其他前端框架管理的元素
+        if (isFrameworkManagedElement(element)) return true;
+        
         // 跳过隐藏元素
         const style = getComputedStyle(element);
         if (style && (style.display === 'none' || style.visibility === 'hidden')) return true;
@@ -1506,6 +1636,78 @@ self.onmessage = async (e) => {
         
         // 跳过已翻译的元素
         if (element.hasAttribute('data-ft-original') || element.closest('.ft-pair')) return true;
+        
+        return false;
+      }
+      
+      // React组件检测函数
+      function isReactManagedElement(element) {
+        // 检查React Fiber属性
+        const reactFiberKeys = Object.keys(element).filter(key => 
+          key.startsWith('__reactFiber') || 
+          key.startsWith('__reactInternalInstance') ||
+          key.startsWith('_reactInternalFiber')
+        );
+        if (reactFiberKeys.length > 0) return true;
+        
+        // 检查React根容器
+        if (element.hasAttribute('data-reactroot') || 
+            element.id === 'root' || 
+            element.id === 'app' ||
+            element.className.includes('react-') ||
+            element.closest('[data-reactroot]')) {
+          return true;
+        }
+        
+        // 检查React Portal
+        if (element.hasAttribute('data-react-portal')) return true;
+        
+        // 检查React开发工具标记
+        if (element.hasAttribute('data-react-devtools-portal-root')) return true;
+        
+        // 检查常见的React应用容器类名
+        const reactClassPatterns = [
+          /^react-/i,
+          /^app$/i,
+          /^root$/i,
+          /-react-/i,
+          /react-app/i,
+          /react-root/i
+        ];
+        
+        const className = element.className || '';
+        if (reactClassPatterns.some(pattern => pattern.test(className))) {
+          return true;
+        }
+        
+        return false;
+      }
+      
+      // 其他前端框架检测函数
+      function isFrameworkManagedElement(element) {
+        // Vue.js检测
+        if (element.__vue__ || 
+            element.hasAttribute('v-') ||
+            element.hasAttribute('data-v-') ||
+            element.closest('[data-v-]') ||
+            element.id === 'app' && element.className.includes('vue')) {
+          return true;
+        }
+        
+        // Angular检测
+        if (element.hasAttribute('ng-') ||
+            element.hasAttribute('data-ng-') ||
+            element.className.includes('ng-') ||
+            element.closest('[ng-app]') ||
+            element.closest('[data-ng-app]')) {
+          return true;
+        }
+        
+        // Svelte检测
+        if (element.className.includes('svelte-') ||
+            element.hasAttribute('data-svelte-h')) {
+          return true;
+        }
         
         return false;
       }
@@ -1606,6 +1808,12 @@ self.onmessage = async (e) => {
           
           // skip UI panel - critical to prevent UI removal
           if (p.closest('.ft-ui')) return NodeFilter.FILTER_REJECT;
+          
+          // 跳过React管理的元素 - 防止React错误#482
+          if (isReactManagedElement(p)) return NodeFilter.FILTER_REJECT;
+          
+          // 跳过其他前端框架管理的元素
+          if (isFrameworkManagedElement(p)) return NodeFilter.FILTER_REJECT;
           
           // skip hidden
           const style = getComputedStyle(p);
@@ -2334,6 +2542,36 @@ self.onmessage = async (e) => {
     font-size: 0.9em !important;
     color: #333 !important;
     border-radius: 3px !important;
+  }
+  
+  /* React安全翻译样式 */
+  .ft-react-safe-translation {
+    position: absolute !important;
+    background: rgba(0, 123, 255, 0.95) !important;
+    color: white !important;
+    padding: 8px 12px !important;
+    border-radius: 6px !important;
+    font-size: 12px !important;
+    max-width: 300px !important;
+    word-wrap: break-word !important;
+    z-index: 10000 !important;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15) !important;
+    pointer-events: none !important;
+    transition: opacity 0.3s ease !important;
+    border: 1px solid rgba(255,255,255,0.2) !important;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+    line-height: 1.4 !important;
+  }
+  
+  /* React安全翻译悬停效果 */
+  [data-ft-react-safe="true"] {
+    position: relative !important;
+    cursor: help !important;
+  }
+  
+  [data-ft-react-safe="true"]:hover {
+    background-color: rgba(0, 123, 255, 0.1) !important;
+    transition: background-color 0.2s ease !important;
   }
   
   /* 成功/错误状态 */

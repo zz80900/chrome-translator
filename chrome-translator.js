@@ -4,6 +4,7 @@
 // @version      1.0.0
 // @description  Chrome 浏览器原生翻译功能的沉浸式翻译脚本，支持整页翻译、保留原文对照和自动翻译新增内容
 // @author       ndllz
+// @license      GPL-3.0 License
 // @match        *://*/*
 // @run-at       document-end
 // @grant        GM_addStyle
@@ -144,7 +145,8 @@
   function checkPageTranslationStatus() {
     const pairs = document.querySelectorAll('span.ft-pair');
     const oldTranslated = document.querySelectorAll('[data-ft-original]');
-    return pairs.length > 0 || oldTranslated.length > 0;
+    const segmentTranslated = document.querySelectorAll('[data-ft-segment-translated]');
+    return pairs.length > 0 || oldTranslated.length > 0 || segmentTranslated.length > 0;
   }
   
     // init UI selections
@@ -214,52 +216,64 @@
           lastPairKey = pairKey;
         }
   
-                const nodes = collectTextNodes(document.body);
-        ui.progressText.textContent = `扫描到 ${nodes.length} 个文本节点，开始并行翻译（并发 ${MAX_CONCURRENCY}）...`;
-        setButtonState('loading', `扫描到 ${nodes.length} 个文本`);
+                        // 使用新的分段翻译逻辑
+        const segments = collectTextSegments(document.body);
+        ui.progressText.textContent = `扫描到 ${segments.length} 个文本段落，开始并行翻译（并发 ${Math.min(MAX_CONCURRENCY, 3)}）...`;
+        setButtonState('loading', `扫描到 ${segments.length} 个段落`);
         setProgress(0, true);
 
         const useWorker = await canUseWorkerTranslator(realSource, targetLang);
         let done = 0;
         const updateProgress = () => { 
-          if (done % 20 === 0 || done === nodes.length) {
-            const percentage = nodes.length > 0 ? (done / nodes.length) * 100 : 0;
-            ui.progressText.textContent = `已翻译 ${done}/${nodes.length}`;
-            setButtonState('loading', `翻译中 ${done}/${nodes.length}`);
+          if (done % 5 === 0 || done === segments.length) {
+            const percentage = segments.length > 0 ? (done / segments.length) * 100 : 0;
+            ui.progressText.textContent = `已翻译 ${done}/${segments.length} 个段落`;
+            setButtonState('loading', `翻译中 ${done}/${segments.length}`);
             setProgress(percentage, true);
           }
         };
-  
+
+        // 段落翻译使用较低的并发数以保证质量
+        const segmentConcurrency = Math.min(3, MAX_CONCURRENCY);
+
         if (useWorker) {
-          const pool = await createWorkerPool(MAX_CONCURRENCY, realSource, targetLang);
+          const pool = await createWorkerPool(segmentConcurrency, realSource, targetLang);
           try {
-            const tasks = nodes.map(({ node, original, leading, trailing }) => async () => {
-              if (!original.trim()) { done++; updateProgress(); return; }
+            const tasks = segments.map((segment) => async () => {
+              if (!segment.trimmedText) { done++; updateProgress(); return; }
               try {
-                const translated = await pool.translate(original.replace(/\n/g, '<br>'));
+                const translated = await pool.translate(segment.trimmedText.replace(/\n/g, '<br>'));
                 const pretty = (translated || '').replace(/<br>/g, '\n').trim();
-                applyTranslationToNode(node, original, leading, trailing, pretty);
-              } catch {}
+                if (pretty) {
+                  applySegmentTranslation(segment, pretty);
+                }
+              } catch (error) {
+                console.warn('[ChromeTranslator] 段落翻译失败:', error, segment.trimmedText.substring(0, 50));
+              }
               finally { done++; updateProgress(); }
             });
-            await runWithConcurrency(tasks, MAX_CONCURRENCY);
+            await runWithConcurrency(tasks, segmentConcurrency);
           } finally { pool.terminate(); }
         }
         else {
           // Fallback: main-thread concurrency using a single translator instance
-          const limit = createLimiter(Math.max(2, Math.min(3, MAX_CONCURRENCY)));
-          await Promise.all(nodes.map(({ node, original, leading, trailing }) => limit(async () => {
-            if (!original.trim()) { done++; updateProgress(); return; }
+          const limit = createLimiter(segmentConcurrency);
+          await Promise.all(segments.map((segment) => limit(async () => {
+            if (!segment.trimmedText) { done++; updateProgress(); return; }
             try {
-              const translated = await translateStreaming(`${original.replace(/\n/g, '<br>')}`);
+              const translated = await translateStreaming(segment.trimmedText.replace(/\n/g, '<br>'));
               const pretty = (translated || '').replace(/<br>/g, '\n').trim();
-              applyTranslationToNode(node, original, leading, trailing, pretty);
-            } catch {}
+              if (pretty) {
+                applySegmentTranslation(segment, pretty);
+              }
+            } catch (error) {
+              console.warn('[ChromeTranslator] 段落翻译失败:', error, segment.trimmedText.substring(0, 50));
+            }
             finally { done++; updateProgress(); }
           })));
         }
   
-              ui.progressText.textContent = `翻译完成：${done}/${nodes.length}`;
+              ui.progressText.textContent = `翻译完成：${done}/${segments.length} 个段落`;
       
       // 更新翻译状态
       isPageTranslated = true;
@@ -267,7 +281,7 @@
       // 显示成功状态
       ui.fab.classList.add('ft-success', 'ft-translated');
       ui.container.updateFabTooltip(); // 更新提示词
-      setButtonState('success', `翻译完成 ${done}/${nodes.length}`);
+      setButtonState('success', `翻译完成 ${done}/${segments.length}`);
       setProgress(100, false); // 隐藏进度条
       setTimeout(() => {
         ui.fab.classList.remove('ft-success');
@@ -297,9 +311,10 @@
     }
   
     function restorePage() {
-      // unwrap ft-pair wrappers first
-      const pairs = Array.from(document.querySelectorAll('span.ft-pair'));
       let restored = 0;
+      
+      // 还原新的段落翻译结构
+      const pairs = Array.from(document.querySelectorAll('span.ft-pair'));
       for (const w of pairs) {
         const original = w.getAttribute('data-ft-original-text') || w.querySelector('.ft-original')?.textContent || '';
         const leading = w.getAttribute('data-ft-leading') || '';
@@ -308,7 +323,16 @@
         w.replaceWith(textNode);
         restored++;
       }
-      // compatibility: old style replacements
+      
+      // 清理段落级别的翻译标记
+      const segmentElements = Array.from(document.querySelectorAll('[data-ft-segment-translated]'));
+      for (const element of segmentElements) {
+        element.removeAttribute('data-ft-segment-translated');
+        element.removeAttribute('data-ft-segment-original');
+        element.removeAttribute('data-ft-segment-translated');
+      }
+      
+      // 兼容性：处理旧式翻译标记
       const iter = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
       let node;
       while ((node = iter.nextNode())) {
@@ -322,19 +346,20 @@
           restored++;
         }
       }
-          ui.progressText.textContent = `已还原 ${restored} 个文本节点`;
+      
+      ui.progressText.textContent = `已还原 ${restored} 个翻译元素`;
     
-    // 更新翻译状态
-    isPageTranslated = false;
-    
-    // 显示成功状态并移除翻译状态
-    ui.fab.classList.add('ft-success');
-    ui.fab.classList.remove('ft-translated');
-          ui.container.updateFabTooltip(); // 更新提示词
-    setButtonState('success', `已还原 ${restored} 个节点`);
-    setTimeout(() => {
-      ui.fab.classList.remove('ft-success');
-    }, 2000); // 2秒后移除成功状态
+      // 更新翻译状态
+      isPageTranslated = false;
+      
+      // 显示成功状态并移除翻译状态
+      ui.fab.classList.add('ft-success');
+      ui.fab.classList.remove('ft-translated');
+      ui.container.updateFabTooltip(); // 更新提示词
+      setButtonState('success', `已还原 ${restored} 个元素`);
+      setTimeout(() => {
+        ui.fab.classList.remove('ft-success');
+      }, 2000); // 2秒后移除成功状态
     }
   
     function setupObserver(enabled) {
@@ -677,8 +702,142 @@ self.onmessage = async (e) => {
     }
   
     // --------------------------
-    // DOM: text nodes
+    // DOM: text segments (improved for better translation)
     // --------------------------
+    
+    // 新的分段翻译：按DOM元素收集完整文本段落
+    function collectTextSegments(root) {
+      const segments = [];
+      const processedElements = new Set();
+      
+      // 定义容器元素类型 - 这些元素通常包含完整的语义单元
+      const containerTags = new Set([
+        'p', 'div', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+        'li', 'td', 'th', 'blockquote', 'article', 'section',
+        'header', 'footer', 'main', 'aside', 'nav', 'figcaption',
+        'summary', 'details', 'label', 'legend', 'caption'
+      ]);
+      
+      // 遍历所有可能的容器元素
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+        acceptNode(element) {
+          // 跳过已处理的元素
+          if (processedElements.has(element)) return NodeFilter.FILTER_REJECT;
+          
+          // 跳过翻译UI
+          if (element.closest('.ft-ui')) return NodeFilter.FILTER_REJECT;
+          
+          // 跳过隐藏元素
+          const style = getComputedStyle(element);
+          if (style && (style.display === 'none' || style.visibility === 'hidden')) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          
+          // 跳过不需要翻译的元素
+          const tag = element.tagName.toLowerCase();
+          if (['script','style','noscript','textarea','input','code','pre','svg','math','kbd','samp'].includes(tag)) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          
+          // 跳过标记为不翻译的元素
+          if (element.closest('.notranslate,[translate="no"]')) return NodeFilter.FILTER_REJECT;
+          
+          // 跳过已翻译的元素
+          if (element.hasAttribute('data-ft-original') || element.closest('.ft-pair')) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          
+          // 只处理容器元素或包含文本的元素
+          if (containerTags.has(tag) || hasDirectTextContent(element)) {
+            return NodeFilter.FILTER_ACCEPT;
+          }
+          
+          return NodeFilter.FILTER_SKIP;
+        }
+      });
+      
+      let element;
+      while ((element = walker.nextNode())) {
+        if (processedElements.has(element)) continue;
+        
+        const segment = collectElementTextSegment(element, processedElements);
+        if (segment && segment.textNodes.length > 0) {
+          segments.push(segment);
+        }
+      }
+      
+      return segments;
+    }
+    
+    // 检查元素是否直接包含文本内容
+    function hasDirectTextContent(element) {
+      for (const child of element.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE && child.nodeValue.trim()) {
+          return true;
+        }
+      }
+      return false;
+    }
+    
+    // 收集单个元素的文本段落
+    function collectElementTextSegment(element, processedElements) {
+      const textNodes = [];
+      let fullText = '';
+      
+      // 递归收集元素内的所有文本节点
+      function collectTextNodesRecursive(node) {
+        if (node.nodeType === Node.TEXT_NODE) {
+          const text = node.nodeValue || '';
+          if (text.trim()) {
+            textNodes.push({
+              node: node,
+              text: text,
+              startIndex: fullText.length,
+              endIndex: fullText.length + text.length
+            });
+            fullText += text;
+          }
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+          // 跳过不需要翻译的子元素
+          const tag = node.tagName.toLowerCase();
+          if (['script','style','noscript','textarea','input','code','pre','svg','math','kbd','samp'].includes(tag)) {
+            return;
+          }
+          
+          // 跳过标记为不翻译的子元素
+          if (node.closest('.notranslate,[translate="no"]')) return;
+          
+          // 跳过已翻译的子元素
+          if (node.hasAttribute('data-ft-original') || node.closest('.ft-pair')) return;
+          
+          // 递归处理子节点
+          for (const child of node.childNodes) {
+            collectTextNodesRecursive(child);
+          }
+        }
+      }
+      
+      collectTextNodesRecursive(element);
+      
+      // 清理和验证文本内容
+      const trimmedText = fullText.trim();
+      if (!trimmedText || trimmedText.length < 2) return null;
+      
+      // 跳过纯标点符号
+      if (/^[\s\p{P}\p{S}]+$/u.test(trimmedText)) return null;
+      
+      // 标记元素为已处理
+      processedElements.add(element);
+      
+      return {
+        element: element,
+        textNodes: textNodes,
+        originalText: fullText,
+        trimmedText: trimmedText
+      };
+    }
+    
+    // 保留原有的collectTextNodes函数作为备用
     function collectTextNodes(root) {
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
@@ -1542,6 +1701,8 @@ self.onmessage = async (e) => {
   .ft-pair{ display:inline; }
   .ft-pair .ft-original{ opacity:.6; margin-right:.35em; }
   .ft-pair:not(.show-original) .ft-original{ display:none; }
+  .ft-segment{ display:inline; }
+  .ft-segment .ft-pair{ display:inline; }
   @media (prefers-color-scheme: dark){
   .ft-fab{ background:#222; border-color:#444; color:#eee; }
   .ft-ui:hover .ft-fab{ background:#333; }
@@ -1746,6 +1907,94 @@ self.onmessage = async (e) => {
       });
     }
   
+        // 新的段落翻译应用函数
+    function applySegmentTranslation(segment, translatedText) {
+      if (!segment || !segment.textNodes || segment.textNodes.length === 0) return;
+      
+      const { element, textNodes, originalText } = segment;
+      const trimmedOriginal = originalText.trim();
+      const trimmedTranslated = translatedText.trim();
+      
+      if (!trimmedTranslated) return;
+      
+      // 创建段落级别的翻译容器
+      const segmentWrapper = document.createElement('span');
+      segmentWrapper.className = 'ft-segment';
+      if (keepOriginal) segmentWrapper.classList.add('show-original');
+      segmentWrapper.setAttribute('data-ft-segment-original', trimmedOriginal);
+      segmentWrapper.setAttribute('data-ft-segment-translated', trimmedTranslated);
+      
+      // 智能分配翻译结果到各个文本节点
+      const translationParts = intelligentTextDistribution(textNodes, originalText, translatedText);
+      
+      // 为每个文本节点创建翻译对
+      const replacements = [];
+      for (let i = 0; i < textNodes.length; i++) {
+        const textNodeInfo = textNodes[i];
+        const translatedPart = translationParts[i] || '';
+        
+        if (!translatedPart.trim()) continue;
+        
+        const wrapper = document.createElement('span');
+        wrapper.className = 'ft-pair';
+        if (keepOriginal) wrapper.classList.add('show-original');
+        wrapper.setAttribute('data-ft-original-text', textNodeInfo.text);
+        
+        const original = document.createElement('span');
+        original.className = 'ft-original';
+        original.textContent = textNodeInfo.text.trim();
+        
+        const translated = document.createElement('span');
+        translated.className = 'ft-translated';
+        translated.textContent = translatedPart;
+        
+        wrapper.append(original, translated);
+        replacements.push({ node: textNodeInfo.node, wrapper: wrapper });
+      }
+      
+      // 应用替换
+      for (const { node, wrapper } of replacements) {
+        if (node.parentNode) {
+          node.parentNode.replaceChild(wrapper, node);
+        }
+      }
+      
+      // 标记整个元素为已翻译
+      element.setAttribute('data-ft-segment-translated', 'true');
+    }
+    
+    // 智能分配翻译文本到原始文本节点
+    function intelligentTextDistribution(textNodes, originalText, translatedText) {
+      if (textNodes.length === 0) return [];
+      if (textNodes.length === 1) return [translatedText];
+      
+      // 简单策略：按原文长度比例分配翻译文本
+      const totalOriginalLength = originalText.trim().length;
+      const translatedWords = translatedText.trim().split(/\s+/);
+      const results = [];
+      
+      let usedWords = 0;
+      for (let i = 0; i < textNodes.length; i++) {
+        const nodeText = textNodes[i].text.trim();
+        const nodeLength = nodeText.length;
+        
+        if (i === textNodes.length - 1) {
+          // 最后一个节点，分配剩余的所有词
+          results.push(translatedWords.slice(usedWords).join(' '));
+        } else {
+          // 按比例分配词数
+          const ratio = nodeLength / totalOriginalLength;
+          const wordsToAssign = Math.max(1, Math.round(translatedWords.length * ratio));
+          const assignedWords = translatedWords.slice(usedWords, usedWords + wordsToAssign);
+          results.push(assignedWords.join(' '));
+          usedWords += wordsToAssign;
+        }
+      }
+      
+      return results;
+    }
+    
+    // 保留原有的单节点翻译函数作为备用
     function applyTranslationToNode(node, original, leading, trailing, translatedPretty) {
       // Wrap the original text node with a pair container to support toggling
       const wrapper = document.createElement('span');
@@ -1754,15 +2003,15 @@ self.onmessage = async (e) => {
       wrapper.setAttribute('data-ft-original-text', original);
       wrapper.setAttribute('data-ft-leading', leading);
       wrapper.setAttribute('data-ft-trailing', trailing);
-  
+
       const o = document.createElement('span');
       o.className = 'ft-original';
       o.textContent = original.trim();
-  
+
       const t = document.createElement('span');
       t.className = 'ft-translated';
       t.textContent = leading + translatedPretty + trailing;
-  
+
       wrapper.append(o, t);
       node.parentNode && node.parentNode.replaceChild(wrapper, node);
     }

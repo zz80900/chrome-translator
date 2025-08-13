@@ -1,4 +1,0 @@
----
-alwaysApply: true
----
-每一次修改都需要同步更新README.MD和js脚本中的版本号

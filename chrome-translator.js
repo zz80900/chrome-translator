@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chrome Translator
 // @namespace    https://ndllz.cn/
-// @version      1.0.8
+// @version      1.0.9
 // @description  Chrome 浏览器原生翻译功能的沉浸式翻译脚本，支持整页翻译、保留原文对照和自动翻译新增内容
 // @author       ndllz
 // @license      GPL-3.0 License
@@ -206,6 +206,13 @@
       setButtonState('loading', '准备翻译...');
       
       try {
+        // 检查React hydration状态，如果正在hydrating则延迟执行
+        if (isSSREnvironment() && isReactHydrating()) {
+          console.log('[ChromeTranslator] 检测到React正在hydrating，延迟翻译执行');
+          setButtonState('loading', '等待React完成加载...');
+          await waitForHydrationComplete();
+        }
+        
         // 异步优化：并行执行可用性检查和段落收集
         const [availabilityOk, paragraphs] = await Promise.all([
           ensureAvailability(),
@@ -292,9 +299,9 @@
             return;
           }
           
-          // 检查是否为React管理的元素，使用安全模式
-          if (isReactManagedElement(element)) {
-            console.log('[ChromeTranslator] 检测到React元素，使用安全翻译模式');
+          // 检查是否为React管理的元素或SSR环境，使用安全模式
+          if (isReactManagedElement(element) || isSSREnvironment()) {
+            console.log('[ChromeTranslator] 检测到React元素或SSR环境，使用安全翻译模式');
             applyReactSafeTranslation(element, fullText, translatedText);
             return;
           }
@@ -409,9 +416,24 @@
           }
         }
         
-        // React安全翻译函数 - 非侵入式翻译
+        // React安全翻译函数 - 非侵入式翻译，支持hydration安全
         function applyReactSafeTranslation(element, originalText, translatedText) {
           try {
+            // 在hydration期间，使用更保守的方式
+            if (isReactHydrating()) {
+              console.log('[ChromeTranslator] React正在hydrating，使用最小侵入模式');
+              // 仅设置title属性，不创建额外DOM元素
+              element.title = `翻译: ${translatedText}`;
+              element.setAttribute('data-ft-hydration-safe', translatedText);
+              element.setAttribute('data-ft-hydration-original', originalText);
+              
+              // 添加轻微的视觉提示
+              element.style.borderBottom = '1px dotted rgba(0, 123, 255, 0.5)';
+              element.style.cursor = 'help';
+              
+              return;
+            }
+            
             // 创建一个浮动的翻译提示框，而不是修改DOM结构
             const translationTooltip = document.createElement('div');
             translationTooltip.className = 'ft-react-safe-translation';
@@ -711,6 +733,18 @@
           element.removeAttribute('data-ft-react-safe-fallback');
           element.removeAttribute('title');
         }
+        restored++;
+      }
+      
+      // 还原hydration安全模式的翻译
+      const hydrationSafeElements = Array.from(document.querySelectorAll('[data-ft-hydration-safe]'));
+      for (const element of hydrationSafeElements) {
+        element.removeAttribute('data-ft-hydration-safe');
+        element.removeAttribute('data-ft-hydration-original');
+        element.removeAttribute('title');
+        // 移除视觉提示样式
+        element.style.borderBottom = '';
+        element.style.cursor = '';
         restored++;
       }
       
@@ -1683,6 +1717,127 @@ self.onmessage = async (e) => {
         return false;
       }
       
+      // React Hydration状态检测函数
+      function isReactHydrating() {
+        // 检查是否存在React根容器但还没有完全hydrated
+        const reactRoots = document.querySelectorAll('[data-reactroot], #root, #app, .react-app');
+        
+        for (const root of reactRoots) {
+          // 检查React Fiber是否已经附加
+          const reactFiberKeys = Object.keys(root).filter(key => 
+            key.startsWith('__reactFiber') || 
+            key.startsWith('__reactInternalInstance')
+          );
+          
+          if (reactFiberKeys.length === 0) {
+            // React根存在但Fiber未附加，可能正在hydrating
+            return true;
+          }
+          
+          // 检查是否有hydration相关的属性
+          if (root.hasAttribute('data-reactroot') && !root.querySelector('[data-reactroot] *')) {
+            return true;
+          }
+        }
+        
+        // 检查Next.js特有的hydration标记
+        if (document.querySelector('#__next') && !window.__NEXT_HYDRATED) {
+          return true;
+        }
+        
+        // 检查Gatsby hydration状态
+        if (window.___gatsby && !window.___gatsby.hydrated) {
+          return true;
+        }
+        
+        return false;
+      }
+      
+      // SSR/SSG环境检测函数
+      function isSSREnvironment() {
+        // 检查Next.js
+        if (document.querySelector('#__next') || window.__NEXT_DATA__) {
+          return true;
+        }
+        
+        // 检查Gatsby
+        if (window.___gatsby || document.querySelector('#___gatsby')) {
+          return true;
+        }
+        
+        // 检查Nuxt.js
+        if (window.__NUXT__ || document.querySelector('#__nuxt')) {
+          return true;
+        }
+        
+        // 检查其他SSR框架标记
+        const ssrIndicators = [
+          'data-server-rendered',
+          'data-reactroot',
+          'data-hydrate'
+        ];
+        
+        return ssrIndicators.some(indicator => 
+          document.querySelector(`[${indicator}]`)
+        );
+      }
+      
+      // 等待React Hydration完成的函数
+      async function waitForHydrationComplete() {
+        const maxWaitTime = 5000; // 最大等待5秒
+        const checkInterval = 100; // 每100ms检查一次
+        let waitedTime = 0;
+        
+        return new Promise((resolve) => {
+          // 尝试监听React hydration相关事件
+          const eventListeners = [];
+          
+          // Next.js hydration事件
+          if (window.__NEXT_DATA__) {
+            const nextHydrationListener = () => {
+              console.log('[ChromeTranslator] Next.js hydration事件触发');
+              cleanup();
+              resolve();
+            };
+            window.addEventListener('load', nextHydrationListener);
+            eventListeners.push(['load', nextHydrationListener]);
+          }
+          
+          // React DevTools hydration事件
+          if (window.__REACT_DEVTOOLS_GLOBAL_HOOK__) {
+            const reactHydrationListener = () => {
+              console.log('[ChromeTranslator] React DevTools hydration事件触发');
+              cleanup();
+              resolve();
+            };
+            window.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot = reactHydrationListener;
+          }
+          
+          // 清理函数
+          const cleanup = () => {
+            eventListeners.forEach(([event, listener]) => {
+              window.removeEventListener(event, listener);
+            });
+          };
+          
+          // 轮询检查
+          const checkHydration = () => {
+            if (!isReactHydrating() || waitedTime >= maxWaitTime) {
+              console.log(`[ChromeTranslator] React hydration完成，等待时间: ${waitedTime}ms`);
+              cleanup();
+              resolve();
+              return;
+            }
+            
+            waitedTime += checkInterval;
+            setTimeout(checkHydration, checkInterval);
+          };
+          
+          // 开始检查
+          checkHydration();
+        });
+      }
+      
       // 其他前端框架检测函数
       function isFrameworkManagedElement(element) {
         // Vue.js检测
@@ -2572,6 +2727,18 @@ self.onmessage = async (e) => {
   [data-ft-react-safe="true"]:hover {
     background-color: rgba(0, 123, 255, 0.1) !important;
     transition: background-color 0.2s ease !important;
+  }
+  
+  /* Hydration安全模式样式 */
+  [data-ft-hydration-safe] {
+    border-bottom: 1px dotted rgba(0, 123, 255, 0.5) !important;
+    cursor: help !important;
+    transition: border-color 0.2s ease !important;
+  }
+  
+  [data-ft-hydration-safe]:hover {
+    border-bottom-color: rgba(0, 123, 255, 0.8) !important;
+    background-color: rgba(0, 123, 255, 0.05) !important;
   }
   
   /* 成功/错误状态 */

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chrome Translator
 // @namespace    https://ndllz.cn/
-// @version      1.0.4
+// @version      1.0.5
 // @description  Chrome 浏览器原生翻译功能的沉浸式翻译脚本，支持整页翻译、保留原文对照和自动翻译新增内容
 // @author       ndllz
 // @license      GPL-3.0 License
@@ -198,71 +198,185 @@
     // --------------------------
     // Core: Translate workflow
     // --------------------------
-    async function translatePage(isFromObserver) {
+        async function translatePage(isFromObserver) {
       if (inProgress) return;
       inProgress = true;
       setPanelBusy(true);
       setButtonState('loading', '准备翻译...');
+      
       try {
-        const availabilityOk = await ensureAvailability();
+        // 异步优化：并行执行可用性检查和文本收集
+        const [availabilityOk, nodes] = await Promise.all([
+          ensureAvailability(),
+          Promise.resolve(collectTextNodes(document.body))
+        ]);
+        
         if (!availabilityOk) return;
-  
-        const realSource = await resolveRealSourceLanguage();
-        const pairKey = `${realSource}->${targetLang}`;
-        const instanceOk = await ensureTranslator(realSource, targetLang);
-        if (!instanceOk) return;
-  
-        if (pairKey !== lastPairKey) {
-          // pair changed; helpful to re-run from scratch to avoid mixed language
-          lastPairKey = pairKey;
-        }
-  
-                        // 临时回退到原有的文本节点翻译逻辑以确保内容不丢失
-        console.log('[ChromeTranslator] 使用安全的文本节点翻译模式');
-        const nodes = collectTextNodes(document.body);
-        ui.progressText.textContent = `扫描到 ${nodes.length} 个文本节点，开始并行翻译（并发 ${MAX_CONCURRENCY}）...`;
-        setButtonState('loading', `扫描到 ${nodes.length} 个文本`);
+        
+        console.log(`[ChromeTranslator] 异步并行翻译模式：${nodes.length} 个文本节点`);
+        ui.progressText.textContent = `扫描到 ${nodes.length} 个文本节点，准备异步翻译...`;
+        setButtonState('loading', `准备翻译 ${nodes.length} 个文本`);
         setProgress(0, true);
 
-        const useWorker = await canUseWorkerTranslator(realSource, targetLang);
+        // 异步优化：并行执行语言检测和Worker检查
+        const [realSource, useWorker] = await Promise.all([
+          resolveRealSourceLanguage(),
+          canUseWorkerTranslator('auto', targetLang) // 先用auto检查，后面会更新
+        ]);
+        
+        const pairKey = `${realSource}->${targetLang}`;
+        if (pairKey !== lastPairKey) {
+          lastPairKey = pairKey;
+        }
+
+        // 异步优化：并行初始化翻译器和更新Worker检查
+        const [instanceOk, finalUseWorker] = await Promise.all([
+          ensureTranslator(realSource, targetLang),
+          useWorker ? canUseWorkerTranslator(realSource, targetLang) : Promise.resolve(false)
+        ]);
+        
+        if (!instanceOk) return;
+
+        // 实时进度更新 - 每个翻译完成立即更新
         let done = 0;
+        const startTime = Date.now();
         const updateProgress = () => { 
-          if (done % 20 === 0 || done === nodes.length) {
-            const percentage = nodes.length > 0 ? (done / nodes.length) * 100 : 0;
-            ui.progressText.textContent = `已翻译 ${done}/${nodes.length}`;
-            setButtonState('loading', `翻译中 ${done}/${nodes.length}`);
-            setProgress(percentage, true);
-          }
+          const percentage = nodes.length > 0 ? (done / nodes.length) * 100 : 0;
+          const elapsed = (Date.now() - startTime) / 1000;
+          const rate = done / elapsed;
+          const eta = done > 0 ? (nodes.length - done) / rate : 0;
+          
+          ui.progressText.textContent = `已翻译 ${done}/${nodes.length} (${rate.toFixed(1)}/s, 预计${eta.toFixed(0)}s)`;
+          setButtonState('loading', `翻译中 ${done}/${nodes.length}`);
+          setProgress(percentage, true);
         };
 
-        if (useWorker) {
+        // 流式翻译显示 - 使用异步队列和批量DOM更新
+        const domUpdateQueue = [];
+        let domUpdateScheduled = false;
+        
+        const scheduleDOMUpdate = () => {
+          if (domUpdateScheduled) return;
+          domUpdateScheduled = true;
+          
+          requestAnimationFrame(() => {
+            // 批量应用DOM更新
+            const updates = domUpdateQueue.splice(0);
+            for (const update of updates) {
+              try {
+                applyTranslationToNode(update.node, update.original, update.leading, update.trailing, update.translated);
+              } catch (error) {
+                console.warn('[ChromeTranslator] DOM更新失败:', error);
+              }
+            }
+            domUpdateScheduled = false;
+            
+            // 如果还有更新，继续调度
+            if (domUpdateQueue.length > 0) {
+              scheduleDOMUpdate();
+            }
+          });
+        };
+
+        if (finalUseWorker) {
           const pool = await createWorkerPool(MAX_CONCURRENCY, realSource, targetLang);
           try {
-            const tasks = nodes.map(({ node, original, leading, trailing }) => async () => {
-              if (!original.trim()) { done++; updateProgress(); return; }
+            const tasks = nodes.map(({ node, original, leading, trailing }, index) => async () => {
+              if (!original.trim()) { 
+                done++; 
+                updateProgress(); 
+                return; 
+              }
+              
               try {
                 const translated = await pool.translate(original.replace(/\n/g, '<br>'));
                 const pretty = (translated || '').replace(/<br>/g, '\n').trim();
-                applyTranslationToNode(node, original, leading, trailing, pretty);
-              } catch {}
-              finally { done++; updateProgress(); }
+                
+                // 异步DOM更新队列
+                domUpdateQueue.push({ node, original, leading, trailing, translated: pretty });
+                scheduleDOMUpdate();
+                
+              } catch (error) {
+                console.warn('[ChromeTranslator] Worker翻译失败:', error);
+              } finally { 
+                done++; 
+                updateProgress(); 
+              }
             });
-            await runWithConcurrency(tasks, MAX_CONCURRENCY);
-          } finally { pool.terminate(); }
+            
+            // 使用高级并发控制器
+            await runWithAdvancedConcurrency(tasks, MAX_CONCURRENCY, {
+              adaptiveLimit: true,
+              onProgress: (stats) => {
+                if (stats.successCount % 10 === 0) {
+                  console.log(`[ChromeTranslator] Worker并发状态: 活跃${stats.active}, 队列${stats.queued}, 限制${stats.currentLimit}`);
+                }
+              },
+              onError: (error) => {
+                console.warn('[ChromeTranslator] Worker翻译错误:', error.message);
+              },
+              priorityFn: (index) => {
+                // 优先翻译页面顶部的内容
+                return Math.max(0, 1000 - index);
+              }
+            });
+          } finally { 
+            pool.terminate(); 
+          }
         }
         else {
-          // Fallback: main-thread concurrency using a single translator instance
-          const limit = createLimiter(Math.max(2, Math.min(3, MAX_CONCURRENCY)));
-          await Promise.all(nodes.map(({ node, original, leading, trailing }) => limit(async () => {
-            if (!original.trim()) { done++; updateProgress(); return; }
+          // 主线程异步翻译 - 使用高级并发控制
+          const tasks = nodes.map(({ node, original, leading, trailing }, index) => async () => {
+            if (!original.trim()) { 
+              done++; 
+              updateProgress(); 
+              return; 
+            }
+            
             try {
               const translated = await translateStreaming(`${original.replace(/\n/g, '<br>')}`);
               const pretty = (translated || '').replace(/<br>/g, '\n').trim();
-              applyTranslationToNode(node, original, leading, trailing, pretty);
-            } catch {}
-            finally { done++; updateProgress(); }
-          })));
+              
+              // 异步DOM更新队列
+              domUpdateQueue.push({ node, original, leading, trailing, translated: pretty });
+              scheduleDOMUpdate();
+              
+            } catch (error) {
+              console.warn('[ChromeTranslator] 主线程翻译失败:', error);
+            } finally { 
+              done++; 
+              updateProgress(); 
+            }
+          });
+          
+          await runWithAdvancedConcurrency(tasks, Math.max(2, Math.min(4, MAX_CONCURRENCY)), {
+            adaptiveLimit: true,
+            onProgress: (stats) => {
+              if (stats.successCount % 5 === 0) {
+                console.log(`[ChromeTranslator] 主线程并发状态: 活跃${stats.active}, 队列${stats.queued}, 限制${stats.currentLimit}`);
+              }
+            },
+            onError: (error) => {
+              console.warn('[ChromeTranslator] 主线程翻译错误:', error.message);
+            },
+            priorityFn: (index) => {
+              // 优先翻译页面顶部的内容
+              return Math.max(0, 1000 - index);
+            }
+          });
         }
+        
+        // 等待所有DOM更新完成
+        await new Promise(resolve => {
+          const checkComplete = () => {
+            if (domUpdateQueue.length === 0 && !domUpdateScheduled) {
+              resolve();
+            } else {
+              setTimeout(checkComplete, 50);
+            }
+          };
+          checkComplete();
+        });
   
               ui.progressText.textContent = `翻译完成：${done}/${nodes.length}`;
       
@@ -535,6 +649,81 @@
     // --------------------------
     // Concurrency helpers and Worker pool
     // --------------------------
+        // 优化的并发控制器 - 支持动态调整和优先级
+    function createAdvancedLimiter(limit, options = {}) {
+      let active = 0;
+      const queue = [];
+      const { 
+        onProgress = () => {}, 
+        onError = () => {},
+        adaptiveLimit = false 
+      } = options;
+      
+      let currentLimit = limit;
+      let successCount = 0;
+      let errorCount = 0;
+      
+      const next = () => {
+        if (active >= currentLimit || queue.length === 0) return;
+        
+        const { fn, resolve, reject, priority = 0 } = queue.shift();
+        active++;
+        
+        const startTime = Date.now();
+        Promise.resolve()
+          .then(fn)
+          .then(result => {
+            successCount++;
+            const duration = Date.now() - startTime;
+            
+            // 自适应并发限制
+            if (adaptiveLimit) {
+              if (duration < 1000 && errorCount === 0 && currentLimit < limit * 2) {
+                currentLimit = Math.min(currentLimit + 1, limit * 2);
+              }
+            }
+            
+            onProgress({ successCount, errorCount, active, queued: queue.length, duration });
+            resolve(result);
+          })
+          .catch(error => {
+            errorCount++;
+            
+            // 自适应降低并发
+            if (adaptiveLimit && errorCount > successCount * 0.1) {
+              currentLimit = Math.max(Math.floor(currentLimit * 0.8), 1);
+            }
+            
+            onError(error);
+            reject(error);
+          })
+          .finally(() => { 
+            active--; 
+            next(); 
+          });
+      };
+      
+      return {
+        execute: (fn, priority = 0) => new Promise((resolve, reject) => { 
+          queue.push({ fn, resolve, reject, priority }); 
+          // 按优先级排序
+          queue.sort((a, b) => b.priority - a.priority);
+          next(); 
+        }),
+        getStats: () => ({ active, queued: queue.length, successCount, errorCount, currentLimit })
+      };
+    }
+
+    // 优化的并发执行器
+    async function runWithAdvancedConcurrency(tasks, limit, options = {}) {
+      const limiter = createAdvancedLimiter(limit, options);
+      
+      return Promise.all(tasks.map((task, index) => 
+        limiter.execute(task, options.priorityFn ? options.priorityFn(index) : 0)
+      ));
+    }
+
+    // 保留原有的简单版本作为备用
     function createLimiter(limit) {
       let active = 0;
       const queue = [];
@@ -549,7 +738,7 @@
       };
       return (fn) => new Promise((resolve, reject) => { queue.push({ fn, resolve, reject }); next(); });
     }
-  
+
     async function runWithConcurrency(tasks, limit) {
       const limiter = createLimiter(limit);
       await Promise.all(tasks.map(task => limiter(task)));
@@ -1745,6 +1934,15 @@ self.onmessage = async (e) => {
     100%{ transform:rotate(360deg); }
   }
   
+  /* 异步翻译进度条样式 */
+  .ft-translation-progress{ width:100%; height:2px; background:#f3f4f6; border-radius:1px; margin-top:8px; overflow:hidden; }
+  .ft-progress-bar{ height:100%; background:linear-gradient(90deg, #3b82f6, #8b5cf6); border-radius:1px; width:0%; }
+  @keyframes ft-progress{ 0%{ width:0%; } 100%{ width:100%; } }
+  
+  /* 重试按钮样式 */
+  .ft-retry-button{ transition:all 0.2s ease; }
+  .ft-retry-button:hover{ background:#2563eb !important; transform:translateY(-1px); }
+  
   /* 成功/错误状态 */
   .ft-translate-btn.success{
     background:linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
@@ -2617,19 +2815,29 @@ self.onmessage = async (e) => {
       }
     }
 
+    // 优化的异步划词翻译函数
     async function translateSelectedText(text) {
       if (!hasTranslator()) throw new Error('翻译器不可用');
       
-      // 确保翻译器可用
-      const availabilityOk = await ensureAvailability();
+      // 异步并行执行初始化检查
+      const [availabilityOk, realSource] = await Promise.all([
+        ensureAvailability(),
+        resolveRealSourceLanguage()
+      ]);
+      
       if (!availabilityOk) throw new Error('翻译器不可用');
       
-      const realSource = await resolveRealSourceLanguage();
+      // 异步初始化翻译器
       const instanceOk = await ensureTranslator(realSource, targetLang);
       if (!instanceOk) throw new Error('翻译器初始化失败');
       
-      // 执行翻译
-      const translated = await translateStreaming(text.replace(/\n/g, '<br>'));
+      // 异步执行翻译，添加超时控制
+      const translationPromise = translateStreaming(text.replace(/\n/g, '<br>'));
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('翻译超时')), 8000);
+      });
+      
+      const translated = await Promise.race([translationPromise, timeoutPromise]);
       const result = (translated || '').replace(/<br>/g, '\n').trim();
       
       if (!result) throw new Error('翻译结果为空');

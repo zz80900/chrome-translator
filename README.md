@@ -2,7 +2,7 @@
 
 > 基于Chrome浏览器原生翻译API的沉浸式翻译用户脚本
 
-[![Version](https://img.shields.io/badge/version-1.0.4-blue.svg)](https://github.com/daidr/fancy-translator)
+[![Version](https://img.shields.io/badge/version-1.0.5-blue.svg)](https://github.com/daidr/fancy-translator)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tampermonkey](https://img.shields.io/badge/tampermonkey-compatible-orange.svg)](https://www.tampermonkey.net/)
 

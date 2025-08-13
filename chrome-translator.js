@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chrome Translator
 // @namespace    https://ndllz.cn/
-// @version      1.0.5
+// @version      1.0.6
 // @description  Chrome 浏览器原生翻译功能的沉浸式翻译脚本，支持整页翻译、保留原文对照和自动翻译新增内容
 // @author       ndllz
 // @license      GPL-3.0 License
@@ -147,7 +147,8 @@
     const oldTranslated = document.querySelectorAll('[data-ft-original]');
     const segmentTranslated = document.querySelectorAll('[data-ft-segment-translated]');
     const segmentWrappers = document.querySelectorAll('.ft-segment-wrapper');
-    return pairs.length > 0 || oldTranslated.length > 0 || segmentTranslated.length > 0 || segmentWrappers.length > 0;
+    const paragraphTranslated = document.querySelectorAll('[data-ft-paragraph-translated]');
+    return pairs.length > 0 || oldTranslated.length > 0 || segmentTranslated.length > 0 || segmentWrappers.length > 0 || paragraphTranslated.length > 0;
   }
   
     // init UI selections
@@ -205,17 +206,17 @@
       setButtonState('loading', '准备翻译...');
       
       try {
-        // 异步优化：并行执行可用性检查和文本收集
-        const [availabilityOk, nodes] = await Promise.all([
+        // 异步优化：并行执行可用性检查和段落收集
+        const [availabilityOk, paragraphs] = await Promise.all([
           ensureAvailability(),
-          Promise.resolve(collectTextNodes(document.body))
+          Promise.resolve(collectParagraphsForTranslation(document.body))
         ]);
         
         if (!availabilityOk) return;
         
-        console.log(`[ChromeTranslator] 异步并行翻译模式：${nodes.length} 个文本节点`);
-        ui.progressText.textContent = `扫描到 ${nodes.length} 个文本节点，准备异步翻译...`;
-        setButtonState('loading', `准备翻译 ${nodes.length} 个文本`);
+        console.log(`[ChromeTranslator] 段落级异步翻译模式：${paragraphs.length} 个段落`);
+        ui.progressText.textContent = `扫描到 ${paragraphs.length} 个段落，准备异步翻译...`;
+        setButtonState('loading', `准备翻译 ${paragraphs.length} 个段落`);
         setProgress(0, true);
 
         // 异步优化：并行执行语言检测和Worker检查
@@ -237,17 +238,17 @@
         
         if (!instanceOk) return;
 
-        // 实时进度更新 - 每个翻译完成立即更新
+        // 实时进度更新 - 每个段落翻译完成立即更新
         let done = 0;
         const startTime = Date.now();
         const updateProgress = () => { 
-          const percentage = nodes.length > 0 ? (done / nodes.length) * 100 : 0;
+          const percentage = paragraphs.length > 0 ? (done / paragraphs.length) * 100 : 0;
           const elapsed = (Date.now() - startTime) / 1000;
           const rate = done / elapsed;
-          const eta = done > 0 ? (nodes.length - done) / rate : 0;
+          const eta = done > 0 ? (paragraphs.length - done) / rate : 0;
           
-          ui.progressText.textContent = `已翻译 ${done}/${nodes.length} (${rate.toFixed(1)}/s, 预计${eta.toFixed(0)}s)`;
-          setButtonState('loading', `翻译中 ${done}/${nodes.length}`);
+          ui.progressText.textContent = `已翻译 ${done}/${paragraphs.length} 个段落 (${rate.toFixed(1)}/s, 预计${eta.toFixed(0)}s)`;
+          setButtonState('loading', `翻译中 ${done}/${paragraphs.length}`);
           setProgress(percentage, true);
         };
 
@@ -264,7 +265,11 @@
             const updates = domUpdateQueue.splice(0);
             for (const update of updates) {
               try {
-                applyTranslationToNode(update.node, update.original, update.leading, update.trailing, update.translated);
+                if (update.type === 'paragraph') {
+                  applyParagraphTranslation(update.paragraph, update.translated);
+                } else {
+                  applyTranslationToNode(update.node, update.original, update.leading, update.trailing, update.translated);
+                }
               } catch (error) {
                 console.warn('[ChromeTranslator] DOM更新失败:', error);
               }
@@ -277,46 +282,132 @@
             }
           });
         };
+        
+        // 段落翻译应用函数
+        function applyParagraphTranslation(paragraph, translatedText) {
+          const { element, fullText, textNodes } = paragraph;
+          
+          // 创建段落级翻译标记
+          element.setAttribute('data-ft-paragraph-original', fullText);
+          element.setAttribute('data-ft-paragraph-translated', translatedText);
+          
+          // 智能分配翻译结果到各个文本节点
+          if (textNodes.length === 1) {
+            // 单个文本节点，直接替换
+            const textNode = textNodes[0].node;
+            const wrapper = document.createElement('span');
+            wrapper.className = 'ft-pair';
+            if (keepOriginal) wrapper.classList.add('show-original');
+            wrapper.setAttribute('data-ft-original-text', fullText);
+            
+            const originalSpan = document.createElement('span');
+            originalSpan.className = 'ft-original';
+            originalSpan.textContent = fullText;
+            
+            const translatedSpan = document.createElement('span');
+            translatedSpan.className = 'ft-translated';
+            translatedSpan.textContent = translatedText;
+            
+            wrapper.appendChild(originalSpan);
+            wrapper.appendChild(translatedSpan);
+            
+            textNode.parentNode.replaceChild(wrapper, textNode);
+          } else {
+            // 多个文本节点，保持DOM结构，只替换文本内容
+            // 简化策略：将翻译结果放在第一个文本节点，其他节点清空
+            for (let i = 0; i < textNodes.length; i++) {
+              const textNode = textNodes[i].node;
+              if (i === 0) {
+                // 第一个节点显示完整翻译
+                const wrapper = document.createElement('span');
+                wrapper.className = 'ft-pair';
+                if (keepOriginal) wrapper.classList.add('show-original');
+                wrapper.setAttribute('data-ft-original-text', fullText);
+                
+                const originalSpan = document.createElement('span');
+                originalSpan.className = 'ft-original';
+                originalSpan.textContent = fullText;
+                
+                const translatedSpan = document.createElement('span');
+                translatedSpan.className = 'ft-translated';
+                translatedSpan.textContent = translatedText;
+                
+                wrapper.appendChild(originalSpan);
+                wrapper.appendChild(translatedSpan);
+                
+                textNode.parentNode.replaceChild(wrapper, textNode);
+              } else {
+                // 其他节点隐藏原文，避免重复显示
+                textNode.nodeValue = '';
+              }
+            }
+          }
+        }
 
+        // 添加翻译取消控制器
+        const translationController = new AbortController();
+        
+        // 存储控制器以便外部取消
+        window.currentTranslationController = translationController;
+        
         if (finalUseWorker) {
           const pool = await createWorkerPool(MAX_CONCURRENCY, realSource, targetLang);
           try {
-            const tasks = nodes.map(({ node, original, leading, trailing }, index) => async () => {
-              if (!original.trim()) { 
+            const tasks = paragraphs.map((paragraph, index) => async () => {
+              if (!paragraph.fullText.trim()) { 
                 done++; 
                 updateProgress(); 
                 return; 
               }
               
+              // 检查是否被取消
+              if (translationController.signal.aborted) {
+                throw new Error('翻译已取消');
+              }
+              
               try {
-                const translated = await pool.translate(original.replace(/\n/g, '<br>'));
+                const translated = await pool.translate(paragraph.fullText.replace(/\n/g, '<br>'));
                 const pretty = (translated || '').replace(/<br>/g, '\n').trim();
                 
-                // 异步DOM更新队列
-                domUpdateQueue.push({ node, original, leading, trailing, translated: pretty });
+                // 再次检查是否被取消
+                if (translationController.signal.aborted) {
+                  throw new Error('翻译已取消');
+                }
+                
+                // 异步DOM更新队列 - 段落级更新
+                domUpdateQueue.push({ 
+                  type: 'paragraph', 
+                  paragraph: paragraph, 
+                  translated: pretty 
+                });
                 scheduleDOMUpdate();
                 
               } catch (error) {
-                console.warn('[ChromeTranslator] Worker翻译失败:', error);
+                if (error.message !== '翻译已取消') {
+                  console.warn('[ChromeTranslator] Worker段落翻译失败:', error);
+                }
+                throw error;
               } finally { 
                 done++; 
                 updateProgress(); 
               }
             });
             
-            // 使用高级并发控制器
+            // 使用高级并发控制器 - 段落级翻译
             await runWithAdvancedConcurrency(tasks, MAX_CONCURRENCY, {
               adaptiveLimit: true,
               onProgress: (stats) => {
-                if (stats.successCount % 10 === 0) {
-                  console.log(`[ChromeTranslator] Worker并发状态: 活跃${stats.active}, 队列${stats.queued}, 限制${stats.currentLimit}`);
+                if (stats.successCount % 5 === 0) {
+                  console.log(`[ChromeTranslator] Worker段落翻译状态: 活跃${stats.active}, 队列${stats.queued}, 限制${stats.currentLimit}`);
                 }
               },
               onError: (error) => {
-                console.warn('[ChromeTranslator] Worker翻译错误:', error.message);
+                if (error.message !== '翻译已取消') {
+                  console.warn('[ChromeTranslator] Worker段落翻译错误:', error.message);
+                }
               },
               priorityFn: (index) => {
-                // 优先翻译页面顶部的内容
+                // 优先翻译页面顶部的段落
                 return Math.max(0, 1000 - index);
               }
             });
@@ -325,42 +416,61 @@
           }
         }
         else {
-          // 主线程异步翻译 - 使用高级并发控制
-          const tasks = nodes.map(({ node, original, leading, trailing }, index) => async () => {
-            if (!original.trim()) { 
+          // 主线程异步段落翻译 - 使用高级并发控制
+          const tasks = paragraphs.map((paragraph, index) => async () => {
+            if (!paragraph.fullText.trim()) { 
               done++; 
               updateProgress(); 
               return; 
             }
             
+            // 检查是否被取消
+            if (translationController.signal.aborted) {
+              throw new Error('翻译已取消');
+            }
+            
             try {
-              const translated = await translateStreaming(`${original.replace(/\n/g, '<br>')}`);
+              const translated = await translateStreaming(`${paragraph.fullText.replace(/\n/g, '<br>')}`);
               const pretty = (translated || '').replace(/<br>/g, '\n').trim();
               
-              // 异步DOM更新队列
-              domUpdateQueue.push({ node, original, leading, trailing, translated: pretty });
+              // 再次检查是否被取消
+              if (translationController.signal.aborted) {
+                throw new Error('翻译已取消');
+              }
+              
+              // 异步DOM更新队列 - 段落级更新
+              domUpdateQueue.push({ 
+                type: 'paragraph', 
+                paragraph: paragraph, 
+                translated: pretty 
+              });
               scheduleDOMUpdate();
               
             } catch (error) {
-              console.warn('[ChromeTranslator] 主线程翻译失败:', error);
+              if (error.message !== '翻译已取消') {
+                console.warn('[ChromeTranslator] 主线程段落翻译失败:', error);
+              }
+              throw error;
             } finally { 
               done++; 
               updateProgress(); 
             }
           });
           
-          await runWithAdvancedConcurrency(tasks, Math.max(2, Math.min(4, MAX_CONCURRENCY)), {
+          await runWithAdvancedConcurrency(tasks, Math.max(2, Math.min(6, MAX_CONCURRENCY)), {
             adaptiveLimit: true,
             onProgress: (stats) => {
-              if (stats.successCount % 5 === 0) {
-                console.log(`[ChromeTranslator] 主线程并发状态: 活跃${stats.active}, 队列${stats.queued}, 限制${stats.currentLimit}`);
+              if (stats.successCount % 3 === 0) {
+                console.log(`[ChromeTranslator] 主线程段落翻译状态: 活跃${stats.active}, 队列${stats.queued}, 限制${stats.currentLimit}`);
               }
             },
             onError: (error) => {
-              console.warn('[ChromeTranslator] 主线程翻译错误:', error.message);
+              if (error.message !== '翻译已取消') {
+                console.warn('[ChromeTranslator] 主线程段落翻译错误:', error.message);
+              }
             },
             priorityFn: (index) => {
-              // 优先翻译页面顶部的内容
+              // 优先翻译页面顶部的段落
               return Math.max(0, 1000 - index);
             }
           });
@@ -378,7 +488,7 @@
           checkComplete();
         });
   
-              ui.progressText.textContent = `翻译完成：${done}/${nodes.length}`;
+              ui.progressText.textContent = `翻译完成：${done}/${paragraphs.length} 个段落`;
       
       // 更新翻译状态
       isPageTranslated = true;
@@ -386,7 +496,7 @@
       // 显示成功状态
       ui.fab.classList.add('ft-success', 'ft-translated');
       ui.container.updateFabTooltip(); // 更新提示词
-      setButtonState('success', `翻译完成 ${done}/${nodes.length}`);
+      setButtonState('success', `翻译完成 ${done}/${paragraphs.length}`);
       setProgress(100, false); // 隐藏进度条
       setTimeout(() => {
         ui.fab.classList.remove('ft-success');
@@ -416,9 +526,54 @@
     }
   
     function restorePage() {
+      // 立即取消正在进行的翻译
+      if (window.currentTranslationController) {
+        console.log('[ChromeTranslator] 取消正在进行的翻译');
+        window.currentTranslationController.abort();
+        window.currentTranslationController = null;
+      }
+      
+      // 重置翻译状态
+      inProgress = false;
+      setPanelBusy(false);
+      
       let restored = 0;
       
-      // 还原新的段落翻译结构
+      // 还原段落级翻译结构
+      const paragraphElements = Array.from(document.querySelectorAll('[data-ft-paragraph-original]'));
+      for (const element of paragraphElements) {
+        const originalText = element.getAttribute('data-ft-paragraph-original');
+        element.removeAttribute('data-ft-paragraph-original');
+        element.removeAttribute('data-ft-paragraph-translated');
+        
+        // 还原段落内的文本节点
+        const pairs = element.querySelectorAll('.ft-pair');
+        for (const pair of pairs) {
+          const textNode = document.createTextNode(originalText);
+          pair.replaceWith(textNode);
+          restored++;
+          break; // 只需要还原一次
+        }
+        
+        // 还原被清空的文本节点
+        const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+        let textNode;
+        let hasContent = false;
+        while ((textNode = walker.nextNode())) {
+          if (textNode.nodeValue && textNode.nodeValue.trim()) {
+            hasContent = true;
+            break;
+          }
+        }
+        
+        if (!hasContent) {
+          // 如果没有文本内容，重新设置
+          element.textContent = originalText;
+          restored++;
+        }
+      }
+      
+      // 还原传统的段落翻译结构
       const segmentWrappers = Array.from(document.querySelectorAll('.ft-segment-wrapper'));
       for (const wrapper of segmentWrappers) {
         const originalText = wrapper.getAttribute('data-ft-segment-original') || '';
@@ -463,7 +618,8 @@
         }
       }
       
-      ui.progressText.textContent = `已还原 ${restored} 个翻译元素`;
+      ui.progressText.textContent = `已取消翻译并还原 ${restored} 个元素`;
+      console.log(`[ChromeTranslator] 已取消翻译并还原 ${restored} 个元素`);
     
       // 更新翻译状态
       isPageTranslated = false;
@@ -1213,7 +1369,128 @@ self.onmessage = async (e) => {
       return numberPatterns.some(pattern => pattern.test(text));
     }
     
-    // 增强的collectTextNodes函数 - 支持智能内容过滤
+    // 新的段落级翻译收集函数 - 完整段落翻译，包含链接等内联元素
+    function collectParagraphsForTranslation(root) {
+      const paragraphs = [];
+      const processedElements = new Set();
+      
+      // 段落容器标签 - 这些标签内的内容应该作为完整段落翻译
+      const paragraphTags = ['p', 'div', 'section', 'article', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 
+                            'li', 'td', 'th', 'blockquote', 'figcaption', 'summary', 'details'];
+      
+      // 内联标签 - 这些标签不应该打断段落的完整性
+      const inlineTags = ['a', 'span', 'strong', 'b', 'em', 'i', 'u', 'small', 'mark', 'del', 'ins', 
+                         'sub', 'sup', 'abbr', 'cite', 'dfn', 'time', 'var', 'samp', 'kbd'];
+      
+      function shouldSkipElement(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE) return true;
+        
+        // 跳过UI面板
+        if (element.closest('.ft-ui')) return true;
+        
+        // 跳过隐藏元素
+        const style = getComputedStyle(element);
+        if (style && (style.display === 'none' || style.visibility === 'hidden')) return true;
+        
+        // 跳过代码和脚本标签
+        const tag = element.tagName.toLowerCase();
+        if (['script','style','noscript','textarea','input','code','pre','svg','math'].includes(tag)) return true;
+        
+        // 跳过标记为不翻译的元素
+        if (element.closest('.notranslate,[translate="no"]')) return true;
+        
+        // 跳过已翻译的元素
+        if (element.hasAttribute('data-ft-original') || element.closest('.ft-pair')) return true;
+        
+        return false;
+      }
+      
+      function extractParagraphText(element) {
+        let fullText = '';
+        const textNodes = [];
+        
+        function traverseNodes(node) {
+          if (node.nodeType === Node.TEXT_NODE) {
+            const text = node.nodeValue || '';
+            if (text.trim()) {
+              textNodes.push({
+                node: node,
+                text: text,
+                startIndex: fullText.length,
+                endIndex: fullText.length + text.length
+              });
+              fullText += text;
+            }
+          } else if (node.nodeType === Node.ELEMENT_NODE) {
+            const tag = node.tagName.toLowerCase();
+            
+            // 跳过不需要翻译的子元素
+            if (['script','style','noscript','textarea','input','code','pre','svg','math'].includes(tag)) {
+              return;
+            }
+            
+            // 跳过已翻译的子元素
+            if (node.hasAttribute('data-ft-original') || node.closest('.ft-pair')) return;
+            
+            // 对于内联元素，继续遍历其子节点
+            if (inlineTags.includes(tag) || getComputedStyle(node).display === 'inline') {
+              for (const child of node.childNodes) {
+                traverseNodes(child);
+              }
+            } else {
+              // 对于块级元素，也继续遍历（但这通常不应该发生在段落内）
+              for (const child of node.childNodes) {
+                traverseNodes(child);
+              }
+            }
+          }
+        }
+        
+        traverseNodes(element);
+        
+        return {
+          fullText: fullText.trim(),
+          textNodes: textNodes
+        };
+      }
+      
+      function collectFromElement(element) {
+        if (shouldSkipElement(element) || processedElements.has(element)) return;
+        
+        const tag = element.tagName.toLowerCase();
+        
+        // 如果是段落容器，提取其完整文本
+        if (paragraphTags.includes(tag)) {
+          const { fullText, textNodes } = extractParagraphText(element);
+          
+          if (fullText && fullText.length >= 2 && textNodes.length > 0) {
+            // 智能内容检测 - 跳过不应翻译的内容
+            if (!shouldSkipTranslation(fullText, element)) {
+              paragraphs.push({
+                element: element,
+                fullText: fullText,
+                textNodes: textNodes,
+                tag: tag
+              });
+              processedElements.add(element);
+              return; // 不再处理子元素，因为已经作为完整段落处理
+            }
+          }
+        }
+        
+        // 递归处理子元素
+        for (const child of element.children) {
+          collectFromElement(child);
+        }
+      }
+      
+      collectFromElement(root);
+      
+      console.log(`[ChromeTranslator] 收集到 ${paragraphs.length} 个段落用于翻译`);
+      return paragraphs;
+    }
+
+    // 增强的collectTextNodes函数 - 支持智能内容过滤（保留作为备用）
     function collectTextNodes(root) {
       const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
@@ -2304,18 +2581,28 @@ self.onmessage = async (e) => {
   }
   
     function toggleKeepOriginal(on) {
-      // 处理旧的翻译对结构
+      // 处理翻译对结构
       const pairs = document.querySelectorAll('span.ft-pair');
       pairs.forEach((w) => {
         if (on) w.classList.add('show-original');
         else w.classList.remove('show-original');
       });
       
-      // 处理新的段落翻译结构
+      // 处理段落翻译结构
       const segmentWrappers = document.querySelectorAll('.ft-segment-wrapper');
       segmentWrappers.forEach((w) => {
         if (on) w.classList.add('show-original');
         else w.classList.remove('show-original');
+      });
+      
+      // 处理新的段落级翻译结构
+      const paragraphElements = document.querySelectorAll('[data-ft-paragraph-translated]');
+      paragraphElements.forEach((element) => {
+        const pairs = element.querySelectorAll('.ft-pair');
+        pairs.forEach((pair) => {
+          if (on) pair.classList.add('show-original');
+          else pair.classList.remove('show-original');
+        });
       });
     }
   

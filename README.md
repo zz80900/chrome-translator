@@ -2,7 +2,7 @@
 
 > 基于Chrome浏览器原生翻译API的沉浸式翻译用户脚本
 
-[![Version](https://img.shields.io/badge/version-1.0.8-blue.svg)](https://github.com/daidr/fancy-translator)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/zz80900/chrome-translator)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tampermonkey](https://img.shields.io/badge/tampermonkey-compatible-orange.svg)](https://www.tampermonkey.net/)
 
@@ -189,7 +189,31 @@ localStorage.setItem('ft_debug', 'true');
 
 ## 📝 版本更新
 
-### v1.0.5 (最新版本)
+### v1.2.0 (最新版本)
+
+🚀 **翻译引擎重大升级**：
+
+- ✅ **段落级完整翻译**：完全解决包含`<a>`标签等内联元素的段落翻译穿插问题
+- ✅ **语义连贯性保障**：整段翻译而非元素级分割，避免中英文混合
+- ✅ **即时翻译取消**：悬浮按钮支持翻译进行中立即取消并还原
+- ✅ **状态可视化指示**：右上角圆圈显示翻译状态（黄色=进行中，绿色=已完成）
+- ✅ **进度信息优化**：进度显示在状态文本区域，不干扰翻译按钮
+
+🎨 **用户界面增强**：
+
+- 🟡 **翻译中状态**：悬浮图标右上角显示黄色圆圈指示翻译进行中
+- 🟢 **翻译完成状态**：绿色圆圈指示翻译已完成
+- 📊 **状态文本显示**：进度信息在"翻译模型就绪"位置实时更新
+- ⚡ **即时响应**：翻译过程中点击悬浮按钮立即取消并还原原文
+
+🔧 **技术架构重构**：
+
+- 🏗️ **元素级翻译引擎**：从文本节点级升级为元素级翻译处理
+- 📦 **完整HTML保存**：保留原始HTML结构，支持完美还原
+- 🔄 **向后兼容性**：支持新旧翻译格式的混合还原
+- 🎯 **智能容器识别**：识别段落、列表、表格等真实文本容器
+
+### v1.0.5
 
 🚀 **重大功能升级**：
 
@@ -209,6 +233,34 @@ localStorage.setItem('ft_debug', 'true');
 - 🧠 **自适应并发控制**：智能性能优化
 - 🎯 **优先级队列调度**：用户体验优先
 - 🔄 **批量DOM更新**：减少页面重排重绘
+
+### v1.1.2
+
+🚀 **文案收集优化**：
+
+- ✅ **纯DOM文本收集**：新增直接从DOM元素textContent获取文案的策略
+- 🎯 **绕过React检测**：将纯DOM收集作为主要策略，避免复杂的React检测逻辑
+- 📈 **提升覆盖率**：最小化跳过逻辑，只跳过明确不需要翻译的内容
+- 🔄 **多级降级策略**：纯DOM → 传统检测 → 宽松模式 → 文本节点，确保最大兼容性
+
+### v1.1.1
+
+🐛 **SSR翻译修复**：
+
+- ✅ **修复SSR环境无法翻译**：解决React hydrating完成后仍然跳过翻译的问题
+- 🔧 **智能React检测**：只在真正需要时跳过React元素，hydrating完成后允许翻译
+- 📊 **增强调试日志**：添加详细的元素跳过原因分析
+- 🎯 **精确化策略**：区分"正在hydrating"和"已完成hydrating"的SSR环境
+
+### v1.1.0
+
+🐛 **React兼容性修复**：
+
+- ✅ **修复React错误#423**：解决SSR环境中水合过程的DOM操作冲突
+- 🔧 **增强React检测**：改进React组件和SSR环境的识别逻辑
+- ⚡ **优化时间函数**：使用performance.now()替代Date.now()避免SSR/CSR不一致
+- 🛡️ **DOM操作安全检查**：增加全局DOM操作安全机制
+- 🎯 **延迟执行策略**：在React水合完成前阻止不安全的DOM修改
 
 ### v1.0.4
 
